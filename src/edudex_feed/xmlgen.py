@@ -24,10 +24,10 @@ import datetime as dt
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
 
-from .mapping import normalize_enum, VU_FORM_TEXT_TO_CODE, VU_TYPE_TEXT_TO_CODE, DEFAULT_PROGRAM_FORM, \
-    DEFAULT_PROGRAM_TYPE, DEFAULT_PROGRAM_LEVEL, DEFAULT_DEGREE, DEFAULT_APPLICATION_TYPE, \
-    DEFAULT_PAYMENT_DUE, DEFAULT_START_DATE_DETERMINATION
-from .scrape import ScrapedProgram
+from .mapping import normalize_enum, guess_program_level, VU_FORM_TEXT_TO_CODE, VU_TYPE_TEXT_TO_CODE, \
+    DEFAULT_PROGRAM_FORM, DEFAULT_PROGRAM_TYPE, DEFAULT_DEGREE, DEFAULT_APPLICATION_TYPE, \
+    DEFAULT_PAYMENT_DUE, DEFAULT_START_DATE_DETERMINATION, FALLBACK_CONTACT_NAME, FALLBACK_CONTACT_EMAIL
+from .scrape import ScrapedProgram, _first_fact
 
 NS = {
     "directory": "http://studieData.nl/schema/edudex/directory",
@@ -129,13 +129,13 @@ def build_program_xml(
 
     _sub(pc, "orgUnitId", org_unit_id)
 
-    duration_value, duration_unit = _extract_duration(scraped.facts.get("Duur", ""), override)
+    duration_value, duration_unit = _extract_duration(_first_fact(scraped.facts, "Duur", "Duration"), override)
     dur_el = _sub(pc, "programDuration", str(duration_value))
     dur_el.set("unit", duration_unit)
     if duration_value is None:
         review["programDuration"] = "could not parse a duration from the page; defaulted to 1 month"
 
-    form_text = override.get("programForm") or scraped.facts.get("Vorm", "")
+    form_text = override.get("programForm") or _first_fact(scraped.facts, "Vorm", "Form")
     form_code, matched = normalize_enum(form_text, VU_FORM_TEXT_TO_CODE, DEFAULT_PROGRAM_FORM)
     _sub(pc, "programForm", form_code)
     if not matched:
@@ -143,10 +143,17 @@ def build_program_xml(
 
     _sub(pc, "programId", program_id)
 
-    level_code = override.get("programLevel", DEFAULT_PROGRAM_LEVEL)
+    if "programLevel" in override:
+        level_code = override["programLevel"]
+    else:
+        level_text = " ".join(filter(None, [scraped.title, scraped.heading, scraped.meta_description]))
+        level_code, level_needs_review = guess_program_level(level_text)
+        if level_needs_review:
+            review["programLevel"] = (
+                f"guessed '{level_code}' from title/heading/description text -- please "
+                f"confirm and add a 'programLevel' override in overrides.yaml if wrong"
+            )
     _sub(pc, "programLevel", level_code)
-    if "programLevel" not in override:
-        review["programLevel"] = f"no source data on the page for NLQF/CROHO level; defaulted to '{level_code}'"
 
     location = override.get("programLocation") or "Amsterdam"
     _sub(pc, "programLocation", location)
@@ -158,15 +165,21 @@ def build_program_xml(
         review["programType"] = f"guessed '{type_code}' -- verify against VU's own classification"
 
     # ---- programContacts -------------------------------------------------------------------
+    # NOTE: the feed editor (editor_email, m.merz@vu.nl) builds/maintains the feed but is
+    # never a contact person for students or programs -- per VU (2026-09-08), when a page
+    # has no scraped contact this MUST fall back to a named contact, not the editor address.
     contacts = _sub(root, "programContacts")
     contact_data = _sub(contacts, "contactData")
-    _sub(contact_data, "contactName", scraped.contact_name or override.get("contactName") or "VU for Professionals")
-    _sub(contact_data, "email", scraped.contact_email or override.get("contactEmail") or editor_email)
+    _sub(contact_data, "contactName", scraped.contact_name or override.get("contactName") or FALLBACK_CONTACT_NAME)
+    _sub(contact_data, "email", scraped.contact_email or override.get("contactEmail") or FALLBACK_CONTACT_EMAIL)
     _sub(contact_data, "role", scraped.contact_role or "informatie")
     if scraped.contact_phone:
         _sub(contact_data, "telephone", scraped.contact_phone)
     if not scraped.contact_email:
-        review["programContacts"] = "no contact email found on the page; used the feed editor address as fallback"
+        review["programContacts"] = (
+            f"no contact email found on the page; used the fallback contact "
+            f"({FALLBACK_CONTACT_NAME} / {FALLBACK_CONTACT_EMAIL})"
+        )
 
     # ---- programCurriculum -------------------------------------------------------------------
     # Mandatory element, but every child (instructionMode, studyLoad, teacher...) is optional,
@@ -176,35 +189,40 @@ def build_program_xml(
     _sub(root, "programCurriculum")
 
     # ---- programDescriptions -----------------------------------------------------------------
+    # xml:lang reflects whichever language the actual scraped content came from
+    # (scraped.content_language) rather than being hardcoded -- a program whose Dutch
+    # page was a stub and got scraped from its English alternate must be tagged "en",
+    # not mislabeled as Dutch text. See scrape.py's stub-page fallback.
+    lang = scraped.content_language or "nl"
     desc = _sub(root, "programDescriptions")
     display_name = scraped.heading or scraped.title or program_id
     name_el = _sub(desc, "programName", display_name[:200])
-    name_el.set("xml:lang", "nl")
+    name_el.set("xml:lang", lang)
 
     summary = (scraped.meta_description or (scraped.description_paragraphs[0] if scraped.description_paragraphs else "") or scraped.title or "")[:200]
     summary_el = _sub(desc, "programSummaryText", summary)
-    summary_el.set("xml:lang", "nl")
+    summary_el.set("xml:lang", lang)
 
     long_desc = " ".join(scraped.description_paragraphs)[:1200] or summary
     desc_el = _sub(desc, "programDescriptionText", long_desc)
-    desc_el.set("xml:lang", "nl")
+    desc_el.set("xml:lang", lang)
 
     if scraped.curriculum_text:
         subj = _sub(desc, "subjectText")
         _sub(subj, "subject", "curriculum")
         st = _sub(subj, "summaryText", scraped.curriculum_text[:500])
-        st.set("xml:lang", "nl")
+        st.set("xml:lang", lang)
 
     if scraped.admission_text:
         subj = _sub(desc, "subjectText")
         _sub(subj, "subject", "admission")
         st = _sub(subj, "summaryText", scraped.admission_text[:500])
-        st.set("xml:lang", "nl")
+        st.set("xml:lang", lang)
 
     # ---- programSchedule ----------------------------------------------------------------------
     schedule = _sub(root, "programSchedule")
     generic_run = _sub(schedule, "genericProgramRun")
-    price = override.get("tuitionFeeAmount") or _extract_price(scraped.facts.get("Kosten", ""))
+    price = override.get("tuitionFeeAmount") or _extract_price(_first_fact(scraped.facts, "Kosten", "Costs", "Cost"))
     if price is not None:
         # NOTE: costData's children are order-strict per the live XSD:
         # amount, amountIsFinal, costType, currency, isRequiredCost (others optional/omitted).
@@ -220,7 +238,7 @@ def build_program_xml(
     # NOTE: genericProgramRun has no <summaryText> child in the live XSD (its only
     # free-text outlet is the untyped <genericProgramRunFree>) -- start-date hints
     # that don't parse into a real date go there instead of being dropped silently.
-    start_text = override.get("startText") or scraped.facts.get("Startdatum", "")
+    start_text = override.get("startText") or _first_fact(scraped.facts, "Startdatum", "Start date", "Startdate")
     if start_text:
         _sub(generic_run, "genericProgramRunFree", start_text[:200])
 
@@ -231,12 +249,26 @@ def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
     if "programDuration" in override:
         return override["programDuration"].get("value", 1), override["programDuration"].get("unit", "month")
     import re
-    m = re.search(r"(\d+)\s*(dag|week|maand|jaar)", text.lower())
+    # Dutch and English unit words, singular/plural, both mapping to the same
+    # EDU-DEX unit codes -- course pages can be scraped in either language
+    # (see scrape.py's stub-page/hreflang fallback).
+    m = re.search(
+        r"(\d+)\s*(dag(?:en)?|week(?:en)?|maand(?:en)?|jaar|jaren|day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)",
+        text.lower(),
+    )
     if not m:
         return 1, "month"
     value = int(m.group(1))
-    unit_map = {"dag": "day", "week": "week", "maand": "month", "jaar": "year"}
-    return value, unit_map[m.group(2)]
+    unit_word = m.group(2)
+    if unit_word.startswith("dag") or unit_word.startswith("day"):
+        unit = "day"
+    elif unit_word.startswith("week"):
+        unit = "week"
+    elif unit_word.startswith("maand") or unit_word.startswith("month"):
+        unit = "month"
+    else:  # jaar/jaren/year/years
+        unit = "year"
+    return value, unit
 
 
 def _extract_price(text: str) -> float | None:
