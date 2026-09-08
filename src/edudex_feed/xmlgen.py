@@ -1,0 +1,294 @@
+"""
+Turn scraped + configured program data into EDU-DEX-compliant XML.
+
+Produces, under ``feed/``:
+  - institute.xml         (one file, describing VU / the org unit)
+  - programs/<programId>.xml   (one file per program)
+  - directory.xml         (the address book EDU-DEX actually polls)
+
+XML namespaces and root-element headers below are taken verbatim from
+EDU-DEX's own technical manual (https://edudex.nl/edudox/ -> "meer
+documentatie" -> technical infrastructure chapter, section 5.16 "XML
+headers"). Element names, cardinalities and enumerations for the ``program``
+file come from EDU-DEX's own reference tool
+(https://edudex.nl/edudox/ -> "program" tab), captured in mapping.py.
+
+The ``directory.xml`` field list is comparatively lightly documented, so
+validate.py double-checks every generated file against the live XSD at
+http://studieData.nl/schema/edudex/*.xsd on every run -- treat that as the
+final authority, not this file.
+"""
+from __future__ import annotations
+
+import datetime as dt
+from xml.etree import ElementTree as ET
+from xml.dom import minidom
+
+from .mapping import normalize_enum, VU_FORM_TEXT_TO_CODE, VU_TYPE_TEXT_TO_CODE, DEFAULT_PROGRAM_FORM, \
+    DEFAULT_PROGRAM_TYPE, DEFAULT_PROGRAM_LEVEL, DEFAULT_DEGREE, DEFAULT_APPLICATION_TYPE, \
+    DEFAULT_PAYMENT_DUE, DEFAULT_START_DATE_DETERMINATION
+from .scrape import ScrapedProgram
+
+NS = {
+    "directory": "http://studieData.nl/schema/edudex/directory",
+    "program": "http://studieData.nl/schema/edudex/program",
+    "institute": "http://studieData.nl/schema/edudex/institute",
+    "xsi": "http://www.w3.org/2001/XMLSchema-instance",
+}
+
+
+def _pretty(elem: ET.Element) -> bytes:
+    rough = ET.tostring(elem, encoding="utf-8")
+    reparsed = minidom.parseString(rough)
+    # Drop blank lines toprettyxml tends to leave between text-only elements.
+    pretty = reparsed.toprettyxml(indent="  ", encoding="utf-8")
+    lines = [line for line in pretty.decode("utf-8").splitlines() if line.strip()]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _sub(parent: ET.Element, tag: str, text: str | None = None, **attrs) -> ET.Element:
+    el = ET.SubElement(parent, tag, attrs)
+    if text is not None:
+        el.text = text
+    return el
+
+
+def slugify_program_id(scraped: ScrapedProgram, fallback_index: int) -> str:
+    if scraped.vu_id:
+        return scraped.vu_id
+    # last path segment of the URL, e.g. "basisopleiding-verandermanagement"
+    parts = [p for p in scraped.url.rstrip("/").split("/") if p]
+    return parts[-1] if parts else f"program-{fallback_index}"
+
+
+def build_program_xml(
+    scraped: ScrapedProgram,
+    *,
+    org_unit_id: str,
+    editor_email: str,
+    generator_name: str,
+    expires_in_days: int,
+    override: dict | None = None,
+) -> tuple[ET.Element, dict]:
+    """Build one <program> element.
+
+    Returns (element, review_notes) -- review_notes lists every field this
+    function had to guess at, so it can be surfaced in the run summary.
+    """
+    override = override or {}
+    review: dict[str, str] = {}
+
+    root = ET.Element("program", {
+        "xmlns": NS["program"],
+        "xmlns:xsi": NS["xsi"],
+        "xsi:schemaLocation": f"{NS['program']} {NS['program']}.xsd",
+    })
+
+    _sub(root, "editor", editor_email)
+    expires = (dt.date.today() + dt.timedelta(days=expires_in_days)).isoformat()
+    _sub(root, "expires", expires)
+    _sub(root, "format", "EDU-DEX 1.0")
+    _sub(root, "generator", generator_name)
+    last_edited = scraped.last_modified or dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    _sub(root, "lastEdited", _to_iso_datetime(last_edited))
+
+    # ---- programAdmission ----------------------------------------------------------------
+    # NOTE: emitted before programClassification to match the element order shown in
+    # EDU-DEX's own reference tool (https://edudex.nl/edudox/ -> "program" tab). Their
+    # documentation doesn't say outright whether the schema uses xs:sequence (order-strict)
+    # or xs:all (order-free) for the program's top-level children, so we play it safe and
+    # match their own ordering; validate.py's live-XSD check will catch it either way if
+    # this guess is wrong.
+    pa = _sub(root, "programAdmission")
+    _sub(pa, "applicationOpen", "true")
+
+    app_type_code = override.get("applicationType", DEFAULT_APPLICATION_TYPE)
+    _sub(pa, "applicationType", app_type_code)
+
+    payment_due_code = override.get("paymentDue", DEFAULT_PAYMENT_DUE)
+    _sub(pa, "paymentDue", payment_due_code)
+    if "paymentDue" not in override:
+        review["paymentDue"] = f"defaulted to '{payment_due_code}' -- not stated on the page, confirm with finance/PDO"
+
+    start_date_code = override.get("startDateDetermination", DEFAULT_START_DATE_DETERMINATION)
+    _sub(pa, "startDateDetermination", start_date_code)
+
+    # ---- programClassification ---------------------------------------------------------
+    pc = _sub(root, "programClassification")
+    program_id = override.get("programId") or slugify_program_id(scraped, 0)
+    _sub(pc, "programId", program_id)
+    _sub(pc, "orgUnitId", org_unit_id)
+
+    duration_value, duration_unit = _extract_duration(scraped.facts.get("Duur", ""), override)
+    dur_el = _sub(pc, "programDuration", str(duration_value))
+    dur_el.set("unit", duration_unit)
+    if duration_value is None:
+        review["programDuration"] = "could not parse a duration from the page; defaulted to 1 month"
+
+    form_text = override.get("programForm") or scraped.facts.get("Vorm", "")
+    form_code, matched = normalize_enum(form_text, VU_FORM_TEXT_TO_CODE, DEFAULT_PROGRAM_FORM)
+    _sub(pc, "programForm", form_code)
+    if not matched:
+        review["programForm"] = f"guessed '{form_code}' from '{form_text}' -- verify"
+
+    type_text = override.get("programType") or (scraped.title or "")
+    type_code, matched = normalize_enum(type_text, VU_TYPE_TEXT_TO_CODE, DEFAULT_PROGRAM_TYPE)
+    _sub(pc, "programType", type_code)
+    if not matched:
+        review["programType"] = f"guessed '{type_code}' -- verify against VU's own classification"
+
+    level_code = override.get("programLevel", DEFAULT_PROGRAM_LEVEL)
+    _sub(pc, "programLevel", level_code)
+    if "programLevel" not in override:
+        review["programLevel"] = f"no source data on the page for NLQF/CROHO level; defaulted to '{level_code}'"
+
+    degree_code = override.get("degree", DEFAULT_DEGREE)
+    _sub(pc, "degree", degree_code)
+    if "degree" not in override:
+        review["degree"] = f"defaulted to '{degree_code}' -- confirm what VU actually issues on completion"
+
+    location = override.get("programLocation") or "Amsterdam"
+    _sub(pc, "programLocation", location)
+
+    # ---- programContacts -------------------------------------------------------------------
+    contacts = _sub(root, "programContacts")
+    contact_data = _sub(contacts, "contactData")
+    _sub(contact_data, "contactName", scraped.contact_name or override.get("contactName") or "VU for Professionals")
+    _sub(contact_data, "email", scraped.contact_email or override.get("contactEmail") or editor_email)
+    _sub(contact_data, "role", scraped.contact_role or "informatie")
+    if scraped.contact_phone:
+        _sub(contact_data, "telephone", scraped.contact_phone)
+    if not scraped.contact_email:
+        review["programContacts"] = "no contact email found on the page; used the feed editor address as fallback"
+
+    # ---- programCurriculum -------------------------------------------------------------------
+    # Mandatory element, but every child (instructionMode, studyLoad, teacher...) is optional,
+    # so an empty <programCurriculum/> is valid when we have nothing more specific to say.
+    # The free-text curriculum description itself is carried in programDescriptions>subjectText
+    # below (subject=curriculum), since that's where EDU-DEX documents it should live.
+    _sub(root, "programCurriculum")
+
+    # ---- programDescriptions -----------------------------------------------------------------
+    desc = _sub(root, "programDescriptions")
+    display_name = scraped.heading or scraped.title or program_id
+    name_el = _sub(desc, "programName", display_name[:200])
+    name_el.set("xml:lang", "nl")
+
+    summary = (scraped.meta_description or (scraped.description_paragraphs[0] if scraped.description_paragraphs else "") or scraped.title or "")[:200]
+    summary_el = _sub(desc, "programSummaryText", summary)
+    summary_el.set("xml:lang", "nl")
+
+    long_desc = " ".join(scraped.description_paragraphs)[:1200] or summary
+    desc_el = _sub(desc, "programDescriptionText", long_desc)
+    desc_el.set("xml:lang", "nl")
+
+    if scraped.curriculum_text:
+        subj = _sub(desc, "subjectText")
+        _sub(subj, "subject", "curriculum")
+        st = _sub(subj, "summaryText", scraped.curriculum_text[:500])
+        st.set("xml:lang", "nl")
+
+    if scraped.admission_text:
+        subj = _sub(desc, "subjectText")
+        _sub(subj, "subject", "admission")
+        st = _sub(subj, "summaryText", scraped.admission_text[:500])
+        st.set("xml:lang", "nl")
+
+    # ---- programSchedule ----------------------------------------------------------------------
+    schedule = _sub(root, "programSchedule")
+    generic_run = _sub(schedule, "genericProgramRun")
+    price = override.get("tuitionFeeAmount") or _extract_price(scraped.facts.get("Kosten", ""))
+    if price is not None:
+        cost = _sub(generic_run, "cost")
+        _sub(cost, "costType", "tuition fee")
+        _sub(cost, "amount", str(price))
+        _sub(cost, "amountIsFinal", "true")
+        _sub(cost, "currency", "eur")
+    else:
+        review["cost"] = "could not parse a tuition-fee amount from the 'Kosten' bullet; no <cost> emitted"
+
+    start_text = override.get("startText") or scraped.facts.get("Startdatum", "")
+    if start_text:
+        summary_el2 = _sub(generic_run, "summaryText", start_text[:200])
+
+    return root, review
+
+
+def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
+    if "programDuration" in override:
+        return override["programDuration"].get("value", 1), override["programDuration"].get("unit", "month")
+    import re
+    m = re.search(r"(\d+)\s*(dag|week|maand|jaar)", text.lower())
+    if not m:
+        return 1, "month"
+    value = int(m.group(1))
+    unit_map = {"dag": "day", "week": "week", "maand": "month", "jaar": "year"}
+    return value, unit_map[m.group(2)]
+
+
+def _extract_price(text: str) -> float | None:
+    import re
+    m = re.search(r"([\d.]+),?-?", text.replace("€", "").replace("&euro;", "").strip())
+    if not m:
+        return None
+    raw = m.group(1).replace(".", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _to_iso_datetime(value: str) -> str:
+    """Best-effort conversion of an HTTP-date (RFC 1123) or ISO date to
+    xs:dateTime. Falls back to 'now' if unparseable."""
+    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = dt.datetime.strptime(value, fmt)
+            return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+    return dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def build_institute_xml(config: dict) -> ET.Element:
+    root = ET.Element("instituteData", {
+        "xmlns": NS["institute"],
+        "xmlns:xsi": NS["xsi"],
+        "xsi:schemaLocation": f"{NS['institute']} {NS['institute']}.xsd",
+    })
+    _sub(root, "editor", config["editor_email"])
+    _sub(root, "format", "EDU-DEX 1.0")
+    _sub(root, "generator", config["generator_name"])
+    _sub(root, "orgUnitId", config["org_unit_id"])
+    _sub(root, "instituteName", config["institute_name"])
+    if config.get("website"):
+        _sub(root, "website", config["website"])
+    if config.get("city"):
+        loc = _sub(root, "location")
+        _sub(loc, "city", config["city"])
+        if config.get("address"):
+            _sub(loc, "address", config["address"])
+        if config.get("zipcode"):
+            _sub(loc, "zipcode", config["zipcode"])
+    return root
+
+
+def build_directory_xml(config: dict, institute_url: str, program_urls: list[str]) -> ET.Element:
+    root = ET.Element("edudexDirectory", {
+        "xmlns": NS["directory"],
+        "xmlns:xsi": NS["xsi"],
+        "xsi:schemaLocation": f"{NS['directory']} {NS['directory']}.xsd",
+    })
+    _sub(root, "editor", config["editor_email"])
+    _sub(root, "format", "EDU-DEX 1.0")
+    _sub(root, "generator", config["generator_name"])
+    _sub(root, "orgUnitId", config["org_unit_id"])
+    _sub(root, "instituteDataResource", institute_url)
+    for url in program_urls:
+        _sub(root, "programResource", url)
+    return root
+
+
+def write_pretty(elem: ET.Element, path: str) -> None:
+    with open(path, "wb") as f:
+        f.write(_pretty(elem))
