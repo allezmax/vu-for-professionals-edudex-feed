@@ -114,9 +114,19 @@ def build_program_xml(
     _sub(pa, "startDateDetermination", start_date_code)
 
     # ---- programClassification ---------------------------------------------------------
+    # NOTE: programClassification's children MUST appear in exactly this order --
+    # confirmed against the live XSD (http://studieData.nl/schema/edudex/program.xsd),
+    # which declares them inside an xs:sequence (order-strict, not xs:all):
+    #   degree, orgUnitId, programDuration, programForm, programId, programLevel,
+    #   programLocation, programType (other siblings are optional and omitted here).
     pc = _sub(root, "programClassification")
     program_id = override.get("programId") or slugify_program_id(scraped, 0)
-    _sub(pc, "programId", program_id)
+
+    degree_code = override.get("degree", DEFAULT_DEGREE)
+    _sub(pc, "degree", degree_code)
+    if "degree" not in override:
+        review["degree"] = f"defaulted to '{degree_code}' -- confirm what VU actually issues on completion"
+
     _sub(pc, "orgUnitId", org_unit_id)
 
     duration_value, duration_unit = _extract_duration(scraped.facts.get("Duur", ""), override)
@@ -131,24 +141,21 @@ def build_program_xml(
     if not matched:
         review["programForm"] = f"guessed '{form_code}' from '{form_text}' -- verify"
 
-    type_text = override.get("programType") or (scraped.title or "")
-    type_code, matched = normalize_enum(type_text, VU_TYPE_TEXT_TO_CODE, DEFAULT_PROGRAM_TYPE)
-    _sub(pc, "programType", type_code)
-    if not matched:
-        review["programType"] = f"guessed '{type_code}' -- verify against VU's own classification"
+    _sub(pc, "programId", program_id)
 
     level_code = override.get("programLevel", DEFAULT_PROGRAM_LEVEL)
     _sub(pc, "programLevel", level_code)
     if "programLevel" not in override:
         review["programLevel"] = f"no source data on the page for NLQF/CROHO level; defaulted to '{level_code}'"
 
-    degree_code = override.get("degree", DEFAULT_DEGREE)
-    _sub(pc, "degree", degree_code)
-    if "degree" not in override:
-        review["degree"] = f"defaulted to '{degree_code}' -- confirm what VU actually issues on completion"
-
     location = override.get("programLocation") or "Amsterdam"
     _sub(pc, "programLocation", location)
+
+    type_text = override.get("programType") or (scraped.title or "")
+    type_code, matched = normalize_enum(type_text, VU_TYPE_TEXT_TO_CODE, DEFAULT_PROGRAM_TYPE)
+    _sub(pc, "programType", type_code)
+    if not matched:
+        review["programType"] = f"guessed '{type_code}' -- verify against VU's own classification"
 
     # ---- programContacts -------------------------------------------------------------------
     contacts = _sub(root, "programContacts")
@@ -199,17 +206,23 @@ def build_program_xml(
     generic_run = _sub(schedule, "genericProgramRun")
     price = override.get("tuitionFeeAmount") or _extract_price(scraped.facts.get("Kosten", ""))
     if price is not None:
+        # NOTE: costData's children are order-strict per the live XSD:
+        # amount, amountIsFinal, costType, currency, isRequiredCost (others optional/omitted).
         cost = _sub(generic_run, "cost")
-        _sub(cost, "costType", "tuition fee")
         _sub(cost, "amount", str(price))
         _sub(cost, "amountIsFinal", "true")
+        _sub(cost, "costType", "tuition fee")
         _sub(cost, "currency", "eur")
+        _sub(cost, "isRequiredCost", "true")
     else:
         review["cost"] = "could not parse a tuition-fee amount from the 'Kosten' bullet; no <cost> emitted"
 
+    # NOTE: genericProgramRun has no <summaryText> child in the live XSD (its only
+    # free-text outlet is the untyped <genericProgramRunFree>) -- start-date hints
+    # that don't parse into a real date go there instead of being dropped silently.
     start_text = override.get("startText") or scraped.facts.get("Startdatum", "")
     if start_text:
-        summary_el2 = _sub(generic_run, "summaryText", start_text[:200])
+        _sub(generic_run, "genericProgramRunFree", start_text[:200])
 
     return root, review
 
@@ -251,6 +264,16 @@ def _to_iso_datetime(value: str) -> str:
 
 
 def build_institute_xml(config: dict) -> ET.Element:
+    # NOTE: instituteData's children are order-strict per the live XSD
+    # (http://studieData.nl/schema/edudex/institute.xsd): editor, expires(opt),
+    # format, generator, orgUnitId(opt), includeInCatalog(opt), lastEdited
+    # (REQUIRED -- easy to miss), accreditation(opt), contactData(opt),
+    # instituteDescriptionText(opt), instituteFoundingDate(opt), instituteKvK(opt),
+    # instituteLocation(opt), instituteName (REQUIRED, needs xml:lang),
+    # instituteSummaryText(opt), media(opt), webLink(opt), instituteDataFree(opt).
+    # Also: there is no "website" or "location" element in this schema -- the
+    # real names are "webLink" (plain anyURI text) and "instituteLocation"
+    # (structured address), used below.
     root = ET.Element("instituteData", {
         "xmlns": NS["institute"],
         "xmlns:xsi": NS["xsi"],
@@ -260,32 +283,70 @@ def build_institute_xml(config: dict) -> ET.Element:
     _sub(root, "format", "EDU-DEX 1.0")
     _sub(root, "generator", config["generator_name"])
     _sub(root, "orgUnitId", config["org_unit_id"])
-    _sub(root, "instituteName", config["institute_name"])
-    if config.get("website"):
-        _sub(root, "website", config["website"])
+    _sub(root, "lastEdited", dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"))
+
     if config.get("city"):
-        loc = _sub(root, "location")
-        _sub(loc, "city", config["city"])
-        if config.get("address"):
-            _sub(loc, "address", config["address"])
-        if config.get("zipcode"):
-            _sub(loc, "zipcode", config["zipcode"])
+        # institute.xsd's <address> complexType is order-strict:
+        # geoCode(opt), addressType, city, country, house_number, street, zipcode.
+        loc = _sub(root, "instituteLocation")
+        _sub(loc, "id", "main")
+        addr = _sub(loc, "address")
+        street, house_number = _split_street_and_number(config.get("address", ""))
+        _sub(addr, "addressType", "visitation")
+        _sub(addr, "city", config["city"])
+        _sub(addr, "country", "nl")
+        _sub(addr, "house_number", house_number or "")
+        _sub(addr, "street", street or config.get("address", ""))
+        _sub(addr, "zipcode", config.get("zipcode", ""))
+
+    name_el = _sub(root, "instituteName", config["institute_name"])
+    name_el.set("xml:lang", "nl")
+
+    if config.get("website"):
+        web_el = _sub(root, "webLink", config["website"])
+        web_el.set("xml:lang", "nl")
+
     return root
 
 
-def build_directory_xml(config: dict, institute_url: str, program_urls: list[str]) -> ET.Element:
+def _split_street_and_number(address: str) -> tuple[str, str]:
+    """Split a Dutch-style 'Straatnaam 123' address into (street, house_number)."""
+    import re
+    m = re.match(r"^(.*?)\s+(\d+\w*)\s*$", address.strip())
+    if m:
+        return m.group(1), m.group(2)
+    return address.strip(), ""
+
+
+def build_directory_xml(
+    config: dict,
+    institute_url: str,
+    programs: list[tuple[str, str]],
+) -> ET.Element:
+    """``programs`` is a list of (program_id, program_url) pairs.
+
+    NOTE: edudexDirectory's children are order-strict per the live XSD
+    (http://studieData.nl/schema/edudex/directory.xsd): editor, generator,
+    version (REQUIRED -- NOT "format", which doesn't exist in this schema),
+    lastEdited(opt), instituteDataResource(opt), orgUnitId, subDirectory*(opt),
+    clientDiscountResource*(opt), programResource*(opt). Each programResource
+    is itself a complex element with children clientId(opt), lastEdited(opt),
+    programId (REQUIRED), resourceUrl (REQUIRED) -- it is NOT plain text.
+    """
     root = ET.Element("edudexDirectory", {
         "xmlns": NS["directory"],
         "xmlns:xsi": NS["xsi"],
         "xsi:schemaLocation": f"{NS['directory']} {NS['directory']}.xsd",
     })
     _sub(root, "editor", config["editor_email"])
-    _sub(root, "format", "EDU-DEX 1.0")
     _sub(root, "generator", config["generator_name"])
-    _sub(root, "orgUnitId", config["org_unit_id"])
+    _sub(root, "version", "1.0")
     _sub(root, "instituteDataResource", institute_url)
-    for url in program_urls:
-        _sub(root, "programResource", url)
+    _sub(root, "orgUnitId", config["org_unit_id"])
+    for program_id, url in programs:
+        pr = _sub(root, "programResource")
+        _sub(pr, "programId", program_id)
+        _sub(pr, "resourceUrl", url)
     return root
 
 
