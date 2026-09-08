@@ -53,6 +53,9 @@ class ScrapedProgram:
     last_modified: Optional[str] = None
     canonical_url: Optional[str] = None
     english_url: Optional[str] = None
+    dutch_url: Optional[str] = None
+    content_language: str = "nl"
+    content_source_url: Optional[str] = None
     heading: Optional[str] = None
     intro_text: Optional[str] = None
     description_paragraphs: list[str] = field(default_factory=list)
@@ -104,6 +107,33 @@ def _parse_head(soup: BeautifulSoup, program: ScrapedProgram) -> None:
     alt_en = soup.find("link", rel="alternate", hreflang="en")
     if alt_en and alt_en.get("href"):
         program.english_url = alt_en["href"].strip()
+
+    alt_nl = soup.find("link", rel="alternate", hreflang="nl")
+    if alt_nl and alt_nl.get("href"):
+        program.dutch_url = alt_nl["href"].strip()
+
+
+def _is_stub_page(soup: BeautifulSoup) -> bool:
+    """True if this page was rendered for a locale that has no real content for
+    this course. vu.nl shows a `[data-widget="notification"]` banner (e.g. "Sorry!
+    The information you are looking for is only available in Dutch/English.") and
+    omits the real contact widget and rich-text fact/description content in that
+    case, even though the page still has a normal <title>/<h1>. Confirmed 2026-09-08
+    against https://vu.nl/nl/.../course-compliance-regulatory-impact-organisational-
+    reponse, whose real content only exists at its English hreflang alternate."""
+    notification = soup.select_one('[data-widget="notification"]')
+    has_contact = soup.select_one('[data-widget="contact"]') is not None
+    has_rich_text_content = bool(soup.select(".vuw-rich-text li, .vuw-rich-text p"))
+    return notification is not None and not has_contact and not has_rich_text_content
+
+
+def _first_fact(facts: dict[str, str], *labels: str) -> str:
+    """Look up a fact bullet by any of several label spellings (Dutch and English
+    course pages use different labels for the same field, e.g. "Kosten"/"Costs")."""
+    for label in labels:
+        if label in facts:
+            return facts[label]
+    return ""
 
 
 def _is_bare_header(p_tag) -> bool:
@@ -163,7 +193,17 @@ def _parse_main_body(soup: BeautifulSoup, program: ScrapedProgram) -> None:
 
 
 def scrape_program(session: requests.Session, base_url: str, slow_down: float = 0.5) -> ScrapedProgram:
-    """Fetch the overview page plus /inhoud and /toelating sub-pages."""
+    """Fetch the overview page plus /inhoud and /toelating sub-pages.
+
+    Some VU courses only have real content in one language: the locale vu.nl
+    serves at ``base_url`` can render a near-empty "stub" -- a notification
+    banner saying the content isn't available in that language, and none of
+    the contact/fact/description content (see ``_is_stub_page``). When that
+    happens, follow the page's own hreflang alternate link to whichever
+    language does have real content and scrape that instead, recording which
+    one was used in ``content_language``/``content_source_url`` so xmlgen.py
+    can tag the generated text with the right xml:lang.
+    """
     program = ScrapedProgram(url=base_url)
 
     soup = _get(session, base_url)
@@ -172,9 +212,38 @@ def scrape_program(session: requests.Session, base_url: str, slow_down: float = 
         return program
 
     _parse_head(soup, program)
+    content_url = base_url
+    program.content_language = "nl"
+
+    if _is_stub_page(soup):
+        fallback_url = program.english_url or program.dutch_url
+        fallback_lang = "en" if fallback_url and fallback_url == program.english_url else "nl"
+        if fallback_url and fallback_url.rstrip("/") != base_url.rstrip("/"):
+            fallback_soup = _get(session, fallback_url)
+            if fallback_soup is not None and not _is_stub_page(fallback_soup):
+                program.errors.append(
+                    f"'{base_url}' has no real content in its own locale; used the "
+                    f"{fallback_lang} version at '{fallback_url}' instead"
+                )
+                soup = fallback_soup
+                content_url = fallback_url
+                program.content_language = fallback_lang
+                _parse_head(soup, program)
+            else:
+                program.errors.append(
+                    f"'{base_url}' looks like a stub page and its alternate-language "
+                    f"version also had no usable content -- please check manually"
+                )
+        else:
+            program.errors.append(
+                f"'{base_url}' looks like a stub page with no alternate-language link "
+                f"to fall back to -- please check manually"
+            )
+
+    program.content_source_url = content_url
     _parse_main_body(soup, program)
 
-    base_url_stripped = base_url.rstrip("/")
+    base_url_stripped = content_url.rstrip("/")
     for sub in SUBPAGES:
         time.sleep(slow_down)
         sub_url = f"{base_url_stripped}/{sub}"
