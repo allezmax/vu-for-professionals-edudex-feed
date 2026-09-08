@@ -1,0 +1,83 @@
+name: Build and publish EDU-DEX feed
+
+on:
+  schedule:
+    # 15:00 UTC = 16:00/17:00 Europe/Amsterdam depending on DST.
+    # EDU-DEX reads feeds nightly *after 18:00 Europe/Amsterdam*, so this
+    # leaves a comfortable margin. Adjust if you want a different cadence.
+    - cron: "0 15 * * *"
+  workflow_dispatch: {}   # lets you trigger a run by hand from the Actions tab
+  push:
+    branches: [main]
+    paths:
+      - "config/**"
+      - "src/**"
+      - ".github/workflows/build-feed.yml"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Install Playwright's Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Check institute.yaml exists
+        run: |
+          if [ ! -f config/institute.yaml ]; then
+            echo "::error::config/institute.yaml is missing. Copy config/institute.example.yaml to config/institute.yaml, fill it in, and commit it."
+            exit 1
+          fi
+
+      - name: Build feed
+        run: |
+          python -m edudex_feed.main \
+            --config config/institute.yaml \
+            --overrides config/overrides.yaml \
+            --feed-dir feed \
+            --report-dir data \
+            --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+
+      - name: Upload run report as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edudex-feed-report
+          path: data/report.md
+
+      - name: Upload feed for Pages
+        if: success()
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: feed
+
+  deploy:
+    needs: build
+    if: success()
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
