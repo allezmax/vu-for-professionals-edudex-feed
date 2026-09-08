@@ -1,0 +1,5 @@
+requests>=2.31
+beautifulsoup4>=4.12
+playwright>=1.40
+pyyaml>=6.0
+xmlschema>=3.0
