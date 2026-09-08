@@ -64,6 +64,7 @@ def run(config_path: Path, overrides_path: Path, feed_dir: Path, report_dir: Pat
 
     session = requests.Session()
     program_urls: list[str] = []
+    program_ids: list[str] = []
     all_reviews: dict[str, dict] = {}
     scraped_cache = []
 
@@ -89,6 +90,7 @@ def run(config_path: Path, overrides_path: Path, feed_dir: Path, report_dir: Pat
 
         program_url = f"{base_url.rstrip('/')}/programs/{program_id}.xml"
         program_urls.append(program_url)
+        program_ids.append(program_id)
 
         if review:
             all_reviews[program_id] = {"title": scraped.title, "url": scraped.url, "fields": review}
@@ -100,7 +102,7 @@ def run(config_path: Path, overrides_path: Path, feed_dir: Path, report_dir: Pat
     xmlgen.write_pretty(institute_element, str(institute_path))
     institute_url = f"{base_url.rstrip('/')}/institute.xml"
 
-    directory_element = xmlgen.build_directory_xml(config, institute_url, program_urls)
+    directory_element = xmlgen.build_directory_xml(config, institute_url, list(zip(program_ids, program_urls)))
     xmlgen.write_pretty(directory_element, str(feed_dir / "directory.xml"))
 
     (report_dir / "scraped.json").write_text(
