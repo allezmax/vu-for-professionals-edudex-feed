@@ -113,27 +113,16 @@ def _parse_head(soup: BeautifulSoup, program: ScrapedProgram) -> None:
         program.dutch_url = alt_nl["href"].strip()
 
 
-def _is_stub_page(soup: BeautifulSoup) -> bool:
-    """True if this page was rendered for a locale that has no real content for
-    this course. vu.nl shows a `[data-widget="notification"]` banner (e.g. "Sorry!
-    The information you are looking for is only available in Dutch/English.") and
-    omits the real contact widget and rich-text fact/description content in that
-    case, even though the page still has a normal <title>/<h1>. Confirmed 2026-09-08
-    against https://vu.nl/nl/.../course-compliance-regulatory-impact-organisational-
-    reponse, whose real content only exists at its English hreflang alternate."""
-    notification = soup.select_one('[data-widget="notification"]')
-    has_contact = soup.select_one('[data-widget="contact"]') is not None
-    has_rich_text_content = bool(soup.select(".vuw-rich-text li, .vuw-rich-text p"))
-    return notification is not None and not has_contact and not has_rich_text_content
-
-
-def _first_fact(facts: dict[str, str], *labels: str) -> str:
-    """Look up a fact bullet by any of several label spellings (Dutch and English
-    course pages use different labels for the same field, e.g. "Kosten"/"Costs")."""
-    for label in labels:
-        if label in facts:
-            return facts[label]
-    return ""
+def _is_link_only(p_tag) -> bool:
+    """True if a <p> is just a call-to-action link like "View the Course in
+    English" / "Bekijk de cursus in het Nederlands" with no other text --
+    these are navigation, not content, and every VU program page (stub or
+    full) carries one to its other-language sibling, so they can't be
+    treated as description text."""
+    text = p_tag.get_text(" ", strip=True)
+    links = p_tag.find_all("a", recursive=False)
+    link_text = " ".join(a.get_text(" ", strip=True) for a in links)
+    return bool(links) and link_text == text
 
 
 def _is_bare_header(p_tag) -> bool:
@@ -146,6 +135,61 @@ def _is_bare_header(p_tag) -> bool:
     return bool(strong_children) and strong_text == text
 
 
+def _real_content_text_len(soup: BeautifulSoup) -> int:
+    """Total length of the page's substantive rich-text content, excluding
+    the site-wide cookie-consent boilerplate (data-widget="cookie-wizard",
+    which duplicates onto every page) and language-switch CTA paragraphs/
+    bullets (see _is_link_only) and fact-list labels."""
+    total = 0
+    for rich in soup.select(".vuw-rich-text"):
+        if rich.find_parent(attrs={"data-widget": "cookie-wizard"}):
+            continue
+        for p in rich.find_all("p", recursive=False):
+            if _is_bare_header(p) or _is_link_only(p):
+                continue
+            total += len(p.get_text(" ", strip=True))
+        for li in rich.find_all("li"):
+            text = li.get_text(" ", strip=True)
+            if not FACT_LINE_RE.match(text):
+                total += len(text)
+    return total
+
+
+def _is_stub_page(soup: BeautifulSoup) -> bool:
+    """True if this page was rendered for a locale that has no real content
+    for this course -- just the title, a facts sidebar, and a "View in
+    English/Dutch" link to the language that does.
+
+    NOTE (2026-09-08): an earlier version of this check looked for a
+    `[data-widget="notification"]` banner, on the assumption it only
+    appears on stub pages. Verified live against
+    vu.nl/nl/.../course-compliance-regulatory-impact-organisational-reponse
+    (a real stub, confirmed by its own "View module in English" link) and
+    vu.nl/nl/.../compliance-integriteit-management/overzicht (a real full
+    page): that notification element is actually a shared, CSS-hidden UI
+    partial present on EVERY course page regardless of content, so it can't
+    tell stub from full -- and both pages carry an "in English"/"in Dutch"
+    convenience link, so that link's mere presence isn't a signal either.
+    What does reliably differ: only the full page has a
+    `[data-widget="contact"]` block (a real content page always names a
+    contact person), and only the stub has next to no real body text once
+    cookie-consent boilerplate and the language-switch link are excluded.
+    """
+    has_contact = soup.select_one('[data-widget="contact"]') is not None
+    if has_contact:
+        return False
+    return _real_content_text_len(soup) < 80
+
+
+def _first_fact(facts: dict[str, str], *labels: str) -> str:
+    """Look up a fact bullet by any of several label spellings (Dutch and English
+    course pages use different labels for the same field, e.g. "Kosten"/"Costs")."""
+    for label in labels:
+        if label in facts:
+            return facts[label]
+    return ""
+
+
 def _parse_main_body(soup: BeautifulSoup, program: ScrapedProgram) -> None:
     title_bar = soup.select_one('[data-widget="title-bar"]')
     if title_bar:
@@ -156,9 +200,11 @@ def _parse_main_body(soup: BeautifulSoup, program: ScrapedProgram) -> None:
         program.heading = h1.get_text(strip=True)
 
     for rich in soup.select(".vuw-rich-text"):
+        if rich.find_parent(attrs={"data-widget": "cookie-wizard"}):
+            continue  # site-wide cookie-consent boilerplate, not program content
         for p in rich.find_all("p", recursive=False):
             text = p.get_text(" ", strip=True)
-            if text and len(text) > 3 and not _is_bare_header(p):
+            if text and len(text) > 3 and not _is_bare_header(p) and not _is_link_only(p):
                 program.description_paragraphs.append(text)
 
         for li in rich.find_all("li"):
@@ -196,13 +242,13 @@ def scrape_program(session: requests.Session, base_url: str, slow_down: float = 
     """Fetch the overview page plus /inhoud and /toelating sub-pages.
 
     Some VU courses only have real content in one language: the locale vu.nl
-    serves at ``base_url`` can render a near-empty "stub" -- a notification
-    banner saying the content isn't available in that language, and none of
-    the contact/fact/description content (see ``_is_stub_page``). When that
-    happens, follow the page's own hreflang alternate link to whichever
-    language does have real content and scrape that instead, recording which
-    one was used in ``content_language``/``content_source_url`` so xmlgen.py
-    can tag the generated text with the right xml:lang.
+    serves at ``base_url`` can render a near-empty "stub" -- title and a facts
+    sidebar only, no contact person and next to no body text (see
+    ``_is_stub_page``). When that happens, follow the page's own hreflang
+    alternate link to whichever language does have real content and scrape
+    that instead, recording which one was used in
+    ``content_language``/``content_source_url`` so xmlgen.py can tag the
+    generated text with the right xml:lang.
     """
     program = ScrapedProgram(url=base_url)
 
@@ -254,9 +300,11 @@ def scrape_program(session: requests.Session, base_url: str, slow_down: float = 
 
         # Merge additional facts/paragraphs found on the sub-page.
         for rich in sub_soup.select(".vuw-rich-text"):
+            if rich.find_parent(attrs={"data-widget": "cookie-wizard"}):
+                continue  # site-wide cookie-consent boilerplate, not program content
             for p in rich.find_all("p", recursive=False):
                 text = p.get_text(" ", strip=True)
-                if text and len(text) > 3:
+                if text and len(text) > 3 and not _is_bare_header(p) and not _is_link_only(p):
                     if sub == "toelating":
                         program.admission_text = (
                             (program.admission_text + "\n\n" + text) if program.admission_text else text
