@@ -57,6 +57,12 @@ jobs:
             --report-dir data \
             --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
 
+      - name: Show report.md (debug)
+        if: always()
+        run: |
+          echo "---- data/report.md ----"
+          cat data/report.md 2>/dev/null || echo "(no report.md found)"
+
       - name: Upload run report as a workflow artifact
         if: always()
         uses: actions/upload-artifact@v4
