@@ -1,0 +1,28 @@
+# Copy this file to institute.yaml and fill in the real values, then commit
+# institute.yaml (it contains no secrets -- everything in it is published in
+# the public feed anyway).
+
+# Your organisation id as registered with EDU-DEX. If VU doesn't have one
+# yet, ask support@edudex.nl -- they maintain the master list at
+# https://feeds.edudex.nl/organizatie-ids/
+org_unit_id: "vu"
+
+# Technical contact EDU-DEX emails when a file fails their nightly validation.
+# Use a role address (a team inbox), not a personal one.
+editor_email: "edudex@vu.nl"
+
+# Free text identifying the software that generated the feed. Any value is
+# fine; it's for your own debugging, EDU-DEX doesn't validate it.
+generator_name: "VU for Professionals / edudex-feed (github actions)"
+
+institute_name: "Vrije Universiteit Amsterdam - School of Business and Economics for Professionals"
+website: "https://vu.nl/nl/onderwijs/professionals"
+city: "Amsterdam"
+address: "De Boelelaan 1105"
+zipcode: "1081 HV"
+
+# How many days ahead each program's <expires> date is set. EDU-DEX drops a
+# program from its database once <expires> is in the past, so this just needs
+# to comfortably outlast the interval between two scheduled runs (default
+# workflow runs daily, so the EDU-DEX-recommended "two weeks" is generous).
+expires_in_days: 21
