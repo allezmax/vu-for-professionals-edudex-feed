@@ -1,0 +1,28 @@
+# Per-program manual corrections/confirmations, keyed by the program's slug
+# (the last segment of its vu.nl URL -- see data/report.md after a run for
+# the exact ids and what each one currently defaults to).
+#
+# The scraper can read a program's title, description, duration and price
+# straight off the page, but EDU-DEX also wants a few things VU's course
+# pages don't state in EDU-DEX's own vocabulary -- the NLQF-style level, the
+# type of diploma/certificate issued, how/when people pay, etc. Anything not
+# listed here gets a conservative default (see mapping.py) and shows up in
+# data/report.md as "needs review" until someone confirms it here.
+#
+# Copy this file to overrides.yaml and fill in entries as data/report.md
+# flags them -- you do not need to fill in every program up front.
+
+programs:
+  basisopleiding-verandermanagement:
+    programLevel: "post-hbo"          # or e.g. "master", "none" -- see mapping.PROGRAM_LEVEL for the full list
+    degree: "certificate of participation"
+    applicationType: "individual"
+    paymentDue: "up-front"
+    startDateDetermination: "fixed starting date"
+    # contactEmail: "pdo.vm.sbe@vu.nl"   # only needed if the page's own contact widget can't be parsed
+
+  # example-programma-met-groepsprijs:
+  #   applicationType: "group"
+  #   programDuration:
+  #     value: 6
+  #     unit: "month"
