@@ -223,11 +223,54 @@ VU_TYPE_TEXT_TO_CODE = {
 # Default when nothing else can be inferred; deliberately conservative.
 DEFAULT_PROGRAM_FORM = "part-time"
 DEFAULT_PROGRAM_TYPE = "regular"
-DEFAULT_PROGRAM_LEVEL = "post-hbo"  # most VU-for-Professionals executive education sits here
 DEFAULT_DEGREE = "certificate of participation"
 DEFAULT_APPLICATION_TYPE = "individual"
 DEFAULT_PAYMENT_DUE = "up-front"
 DEFAULT_START_DATE_DETERMINATION = "fixed starting date"
+
+# --- programClassification > programLevel guessing ----------------------------------------
+# Per VU (2026-09-08): "our parttime MScs are academic masters, our phds are PhD and
+# most other programs are post-academic. Only if you find clear indication that
+# post-hbo should be used, use it. Flag when doubt." -- so post-hbo is intentionally
+# NOT a default; it is only ever used when a program's own title/text says so
+# explicitly. When we can't tell anything at all about a program (no title/heading/
+# description text to even look at), fall back to "none" rather than guessing a level
+# ("Use the fallback 'none'" -- VU, 2026-09-08).
+LEVEL_KEYWORDS: list[tuple[str, str]] = [
+    ("phd", "PhD"),
+    ("doctoral", "PhD"),
+    ("promotietraject", "PhD"),
+    ("msc", "academic master"),
+    ("master of science", "academic master"),
+    ("post-hbo", "post-hbo"),
+    ("post hbo", "post-hbo"),
+]
+DEFAULT_PROGRAM_LEVEL_KNOWN_CATEGORY = "post-academic"  # VU for Professionals' general offering
+DEFAULT_PROGRAM_LEVEL = "none"  # true last-resort: we don't even know enough to guess
+
+
+def guess_program_level(text: str) -> tuple[str, bool]:
+    """Best-effort EDU-DEX programLevel from a program's title/heading/description.
+
+    Returns (code, needs_review). needs_review=True flags a guess for a human to
+    confirm -- level is high-stakes enough that VU asked to be shown every guess,
+    even the considered "post-academic" default, not just outright unknowns.
+    """
+    t = (text or "").lower()
+    for needle, code in LEVEL_KEYWORDS:
+        if needle in t:
+            return code, False  # explicit textual indication, no need to flag
+    if t.strip():
+        return DEFAULT_PROGRAM_LEVEL_KNOWN_CATEGORY, True
+    return DEFAULT_PROGRAM_LEVEL, True
+
+
+# --- programContacts fallback ---------------------------------------------------------------
+# Per VU (2026-09-08): the feed editor (m.merz@vu.nl) builds the feed but is never a
+# contact person for students/programs. When a program page has no scraped contact,
+# use this named fallback instead of the institute's technical editor address.
+FALLBACK_CONTACT_NAME = "René Hulsink"
+FALLBACK_CONTACT_EMAIL = "professionals@vu.nl"
 
 
 def normalize_enum(value: str, table: dict, default: str) -> tuple[str, bool]:
