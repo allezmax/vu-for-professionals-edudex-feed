@@ -51,7 +51,11 @@ def validate_file(xml_path: Path, kind: str, cache_dir: Path) -> list[str]:
 
     errors = []
     for error in schema.iter_errors(str(xml_path)):
-        errors.append(str(error).splitlines()[0])
+        path = getattr(error, "path", None)
+        reason = getattr(error, "reason", None)
+        first_line = str(error).splitlines()[0]
+        detail = f"{first_line} | path={path} | reason={reason}"
+        errors.append(detail)
     return errors
 
 
