@@ -57,11 +57,11 @@ jobs:
             --report-dir data \
             --base-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
 
-      - name: Show report.md (debug)
+      - name: Show XSD validation errors (debug)
         if: always()
         run: |
-          echo "---- data/report.md ----"
-          cat data/report.md 2>/dev/null || echo "(no report.md found)"
+          echo "---- XSD validation errors section of data/report.md ----"
+          awk '/## XSD validation errors/{found=1} found' data/report.md 2>/dev/null || echo "(no report.md found, or no XSD validation errors section)"
 
       - name: Upload run report as a workflow artifact
         if: always()
