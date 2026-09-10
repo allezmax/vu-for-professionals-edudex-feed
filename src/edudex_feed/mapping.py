@@ -265,6 +265,51 @@ def guess_program_level(text: str) -> tuple[str, bool]:
     return DEFAULT_PROGRAM_LEVEL, True
 
 
+# --- programClassification > degree guessing -----------------------------------------------
+# Per Max (2026-09-10): NOT every program ends in a plain certificate of participation --
+# PhDs obviously finish with a PhD, and VU runs a growing number of (part-time/executive)
+# MSc programs. Defaulting every program to "certificate of participation" was flatly wrong
+# for those. Some newer-template course pages state the awarded credential explicitly in a
+# "Diploma:"/"Titels:" (or "Degree:"/"Titles:") fact bullet on their "in het kort"/"at a
+# glance" list (e.g. "Diploma: MSc", "Titels: MSc, EMFC, Register Controller (RC)") -- that's
+# checked first since it's an explicit statement, not a guess. Most VU for Professionals
+# short courses genuinely only award a certificate of participation, so that stays the
+# fallback default (flagged for review, same as before) rather than being replaced by a
+# keyword guess when nothing points elsewhere.
+DEGREE_KEYWORDS: list[tuple[str, str]] = [
+    ("phd", "PhD"),
+    ("doctoral", "PhD"),
+    ("promotietraject", "PhD"),
+    ("msc", "MSc"),
+    ("master of science", "MSc"),
+    ("mba", "MBA"),
+    ("dba", "DBA"),
+    ("llm", "LLM"),
+    ("master of laws", "LLM"),
+    ("master of arts", "MA"),
+]
+
+
+def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
+    """Best-effort EDU-DEX ``degree`` from an explicit "Diploma"/"Titels" fact bullet
+    first (if the page states one), else a keyword guess over title/heading/description
+    text, else the "certificate of participation" default.
+
+    Returns (code, needs_review) -- needs_review=False only when an explicit fact
+    bullet or an unambiguous keyword match was found; the default is always flagged,
+    same philosophy as guess_program_level.
+    """
+    explicit = (explicit_value or "").lower()
+    for needle, code in DEGREE_KEYWORDS:
+        if needle in explicit:
+            return code, False
+    t = (text or "").lower()
+    for needle, code in DEGREE_KEYWORDS:
+        if needle in t:
+            return code, False
+    return DEFAULT_DEGREE, True
+
+
 # --- programContacts fallback ---------------------------------------------------------------
 # Per VU (2026-09-08): the feed editor (m.merz@vu.nl) builds the feed but is never a
 # contact person for students/programs. When a program page has no scraped contact,
