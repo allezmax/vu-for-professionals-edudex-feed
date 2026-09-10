@@ -155,30 +155,38 @@ def _real_content_text_len(soup: BeautifulSoup) -> int:
     return total
 
 
+STUB_CONTENT_THRESHOLD = 80
+
+
 def _is_stub_page(soup: BeautifulSoup) -> bool:
-    """True if this page was rendered for a locale that has no real content
-    for this course -- just the title, a facts sidebar, and a "View in
+    """True if this page's own real content is too thin to trust as this
+    course's description -- just the title, a facts sidebar, and a "View in
     English/Dutch" link to the language that does.
 
-    NOTE (2026-09-08): an earlier version of this check looked for a
-    `[data-widget="notification"]` banner, on the assumption it only
+    NOTE (2026-09-08, first pass): an earlier version of this check looked
+    for a `[data-widget="notification"]` banner, on the assumption it only
     appears on stub pages. Verified live against
     vu.nl/nl/.../course-compliance-regulatory-impact-organisational-reponse
-    (a real stub, confirmed by its own "View module in English" link) and
-    vu.nl/nl/.../compliance-integriteit-management/overzicht (a real full
-    page): that notification element is actually a shared, CSS-hidden UI
-    partial present on EVERY course page regardless of content, so it can't
-    tell stub from full -- and both pages carry an "in English"/"in Dutch"
-    convenience link, so that link's mere presence isn't a signal either.
-    What does reliably differ: only the full page has a
-    `[data-widget="contact"]` block (a real content page always names a
-    contact person), and only the stub has next to no real body text once
-    cookie-consent boilerplate and the language-switch link are excluded.
+    (a real stub) and vu.nl/nl/.../compliance-integriteit-management/overzicht
+    (a real full page): that notification element is actually a shared,
+    CSS-hidden UI partial present on EVERY course page regardless of
+    content, so it can't tell stub from full.
+
+    NOTE (2026-09-08, second pass): that version then gated on
+    `[data-widget="contact"]` being absent, on the assumption a real content
+    page always names a contact person. Also wrong: verified live against
+    vu.nl/nl/.../course-compliance-enterprise-risk-compliance-management,
+    whose Dutch page HAS a contact widget (apparently a shared block
+    rendered for the whole course family) but whose own rich-text content is
+    nothing but the "View the course in English" CTA -- no real description
+    at all, while its English alternate has a full page (33 rich-text items
+    vs. this page's 0 real ones). So contact-widget presence doesn't imply
+    real content either. The one signal that has held up across every case
+    checked so far is real body-text length once cookie-consent boilerplate
+    and the language-switch CTA are excluded -- so that's now the whole
+    check.
     """
-    has_contact = soup.select_one('[data-widget="contact"]') is not None
-    if has_contact:
-        return False
-    return _real_content_text_len(soup) < 80
+    return _real_content_text_len(soup) < STUB_CONTENT_THRESHOLD
 
 
 def _first_fact(facts: dict[str, str], *labels: str) -> str:
