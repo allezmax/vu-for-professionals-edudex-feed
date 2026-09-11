@@ -11,13 +11,29 @@ overview/filter listing page, which fetches its results client-side from
   - this module (scrape.py) uses plain ``requests`` against individual
     program pages, which is faster/lighter and doesn't need a browser.
 
-Each program is spread across up to three URLs:
-  - the overview page itself                      (always exists)
-  - <slug>/inhoud    (curriculum / content)         (usually exists)
-  - <slug>/toelating (admission / cost / practical) (usually exists)
+Each program is spread across up to four URLs, in one of two page templates VU
+uses (per Max, 2026-09-10: the newer template is being rolled out "step by
+step", so both are live at once and neither can be assumed):
 
-Some programs use a different sub-page naming; missing sub-pages are skipped
-without failing the whole run.
+  - the overview page itself                              (always exists)
+  - older template, Dutch slugs (most programs today):
+      <slug>/inhoud      (curriculum / content)
+      <slug>/toelating   (admission / cost / practical)
+  - newer template, adds a dedicated dates-and-costs page and uses different
+    sub-page slugs per language (confirmed live 2026-09-10 against
+    vu.nl/nl/.../controllersopleiding-executive-master-of-finance-control and
+    vu.nl/en/.../part-time-phd-programme-in-finance -- both show the same four
+    tabs: Overview/Overzicht, Curriculum/Inhoud, Admissions/Toelating,
+    "Dates and costs"/"Data en kosten"):
+      nl: <slug>/inhoud, <slug>/toelating, <slug>/data-en-kosten
+      en: <slug>/curriculum, <slug>/admissions, <slug>/dates-and-costs
+
+Some programs use different sub-page naming entirely; missing sub-pages are
+skipped without failing the whole run. Which slug set to try is picked from
+the scraped page's own content language (``content_language``, "nl" or "en")
+since that's already the language whose sub-pages actually exist -- not from
+the original request URL, which may itself have been the stub-page hreflang
+fallback (see ``_is_stub_page``).
 """
 from __future__ import annotations
 
@@ -37,7 +53,14 @@ USER_AGENT = (
     "+https://vu.nl/nl/onderwijs/professionals)"
 )
 
-SUBPAGES = ["inhoud", "toelating"]
+# (slug, category) pairs, keyed by content language. "category" is a stable
+# internal name so downstream code can bucket text/facts by meaning rather
+# than matching on the literal (language-specific) URL slug -- the same
+# category exists in both languages even though the slug differs.
+SUBPAGES_BY_LANG: dict[str, list[tuple[str, str]]] = {
+    "nl": [("inhoud", "curriculum"), ("toelating", "admission"), ("data-en-kosten", "dates_costs")],
+    "en": [("curriculum", "curriculum"), ("admissions", "admission"), ("dates-and-costs", "dates_costs")],
+}
 
 # Matches "<Label>: <value>" bullets inside the rich-text "in het kort" list,
 # e.g. "Startdatum: 2 x per jaar in maart & in september", "Kosten: €7.250,-"
@@ -67,6 +90,7 @@ class ScrapedProgram:
     address_lines: list[str] = field(default_factory=list)
     admission_text: Optional[str] = None
     curriculum_text: Optional[str] = None
+    dates_costs_text: Optional[str] = None
     sub_pages_fetched: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -191,10 +215,24 @@ def _is_stub_page(soup: BeautifulSoup) -> bool:
 
 def _first_fact(facts: dict[str, str], *labels: str) -> str:
     """Look up a fact bullet by any of several label spellings (Dutch and English
-    course pages use different labels for the same field, e.g. "Kosten"/"Costs")."""
+    course pages use different labels for the same field, e.g. "Kosten"/"Costs").
+
+    Matches by substring (case-insensitive), not exact equality: the newer VU
+    page template uses compound labels like "Investering tweejarige master" /
+    "Investering premaster" instead of a plain "Kosten"/"Investering" bullet
+    (confirmed live 2026-09-10 on the Deeltijd Master Bedrijfskunde page), so
+    an exact match would silently find nothing on those pages. Facts are
+    stored in the order they appear on the page (dict insertion order), so
+    when several bullets match the same search label (e.g. both a full-track
+    and a pre-master cost line) this returns whichever came first -- on every
+    real page checked so far that's the standard/full-track figure, since the
+    pre-master or discount line is always listed second.
+    """
     for label in labels:
-        if label in facts:
-            return facts[label]
+        needle = label.lower()
+        for key, value in facts.items():
+            if needle in key.lower():
+                return value
     return ""
 
 
@@ -247,7 +285,9 @@ def _parse_main_body(soup: BeautifulSoup, program: ScrapedProgram) -> None:
 
 
 def scrape_program(session: requests.Session, base_url: str, slow_down: float = 0.5) -> ScrapedProgram:
-    """Fetch the overview page plus /inhoud and /toelating sub-pages.
+    """Fetch the overview page plus its curriculum/admission/dates-and-costs
+    sub-pages (see ``SUBPAGES_BY_LANG`` for the current slug sets -- VU runs
+    two page templates side by side).
 
     Some VU courses only have real content in one language: the locale vu.nl
     serves at ``base_url`` can render a near-empty "stub" -- title and a facts
@@ -298,7 +338,8 @@ def scrape_program(session: requests.Session, base_url: str, slow_down: float = 
     _parse_main_body(soup, program)
 
     base_url_stripped = content_url.rstrip("/")
-    for sub in SUBPAGES:
+    subpages = SUBPAGES_BY_LANG.get(program.content_language, SUBPAGES_BY_LANG["nl"])
+    for sub, category in subpages:
         time.sleep(slow_down)
         sub_url = f"{base_url_stripped}/{sub}"
         sub_soup = _get(session, sub_url)
@@ -313,13 +354,27 @@ def scrape_program(session: requests.Session, base_url: str, slow_down: float = 
             for p in rich.find_all("p", recursive=False):
                 text = p.get_text(" ", strip=True)
                 if text and len(text) > 3 and not _is_bare_header(p) and not _is_link_only(p):
-                    if sub == "toelating":
+                    if category == "admission":
                         program.admission_text = (
                             (program.admission_text + "\n\n" + text) if program.admission_text else text
                         )
-                    elif sub == "inhoud":
+                    elif category == "curriculum":
                         program.curriculum_text = (
                             (program.curriculum_text + "\n\n" + text) if program.curriculum_text else text
+                        )
+                    elif category == "dates_costs":
+                        # NOTE: the "Dates and costs" page often carries itemized/
+                        # tiered pricing as prose (e.g. per-year amounts) rather than
+                        # a single clean "Kosten: €X" bullet -- confirmed live
+                        # 2026-09-10 on vu.nl/en/.../part-time-phd-programme-in-finance,
+                        # whose costs page reads "Year 1 & 2: €12,000/year", "Year 3:
+                        # €6000 / €4000...", etc. That can't be safely collapsed into
+                        # one <cost><amount> without guessing which figure is "the"
+                        # price, so this raw text is kept and surfaced separately
+                        # (see xmlgen.py's "tuition fee" subjectText) rather than fed
+                        # into the single-amount cost parser.
+                        program.dates_costs_text = (
+                            (program.dates_costs_text + "\n\n" + text) if program.dates_costs_text else text
                         )
             for li in rich.find_all("li"):
                 text = li.get_text(" ", strip=True)
