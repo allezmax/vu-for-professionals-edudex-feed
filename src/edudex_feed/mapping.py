@@ -14,6 +14,8 @@ loudly with the real error from the real schema. Fix it here.
 """
 from __future__ import annotations
 
+import re
+
 # --- programClassification > programForm ------------------------------------------------
 # minOccurs=1, maxOccurs=3 (a program may combine e.g. part-time + evening education)
 PROGRAM_FORM = {
@@ -249,6 +251,45 @@ DEFAULT_PROGRAM_LEVEL_KNOWN_CATEGORY = "post-academic"  # VU for Professionals' 
 DEFAULT_PROGRAM_LEVEL = "none"  # true last-resort: we don't even know enough to guess
 
 
+# --- shared keyword-matching precision guards ----------------------------------------------
+# Both guessers above scan free text for short controlled-vocabulary abbreviations
+# ("msc", "mba", "dba", "phd", ...). A plain substring check matches those inside
+# ordinary words too often to trust (see guess_degree's docstring for the real
+# "feedback" -> "dba" collision found live 2026-09-11), so matches require a
+# non-alphanumeric (or string-boundary) character on both sides.
+_KEYWORD_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
+
+def _keyword_present(needle: str, haystack: str) -> bool:
+    pattern = _KEYWORD_PATTERN_CACHE.get(needle)
+    if pattern is None:
+        pattern = re.compile(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])")
+        _KEYWORD_PATTERN_CACHE[needle] = pattern
+    return pattern.search(haystack) is not None
+
+
+# Cues that a nearby degree keyword describes a person's own academic
+# background (a faculty/lecturer bio) rather than the credential this
+# program awards its students -- confirmed live 2026-09-11 on the Parttime
+# MSc Marketing page, whose curriculum text names a lecturer's own "PhD
+# (2001) in Marketing" in a bio paragraph.
+_BIO_CUE_RE = re.compile(
+    r"\b(hij|zij|hem|haar|prof\.?|dr\.|docent|hoogleraar|onderzoeker|"
+    r"promoveerde|behaalde|professor|lecturer|researcher|holds a|"
+    r"received (his|her)|his phd|her phd)\b",
+    re.IGNORECASE,
+)
+
+
+def _sentences_without_bio_cues(text: str) -> str:
+    """Drop sentences that read as a person's own academic-background bio
+    before the degree body-text keyword fallback searches what's left."""
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return " ".join(s for s in sentences if not _BIO_CUE_RE.search(s))
+
+
 def guess_program_level(text: str) -> tuple[str, bool]:
     """Best-effort EDU-DEX programLevel from a program's title/heading/description.
 
@@ -258,7 +299,7 @@ def guess_program_level(text: str) -> tuple[str, bool]:
     """
     t = (text or "").lower()
     for needle, code in LEVEL_KEYWORDS:
-        if needle in t:
+        if _keyword_present(needle, t):
             return code, False  # explicit textual indication, no need to flag
     if t.strip():
         return DEFAULT_PROGRAM_LEVEL_KNOWN_CATEGORY, True
@@ -298,14 +339,32 @@ def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
     Returns (code, needs_review) -- needs_review=False only when an explicit fact
     bullet or an unambiguous keyword match was found; the default is always flagged,
     same philosophy as guess_program_level.
+
+    Two precision guards, both confirmed necessary against the live 2026-09-11
+    catalog pull (which surfaced real, embarrassing false positives across
+    several non-graduate short courses):
+
+    1. Word-boundary matching (``_keyword_present``), not a plain substring
+       check -- "Escaperoom Het Huis van Toezicht" was tagged "DBA" because
+       its testimonials mention "feedback", which contains the literal
+       substring "dba" (fee-D-B-Ack). Short 3-letter codes like "dba"/"mba"/
+       "msc" collide with ordinary words often enough that this isn't a
+       corner case.
+    2. Faculty-bio filtering (``_sentences_without_bio_cues``) on the
+       body-text fallback only -- "Parttime Master of Science in Marketing"
+       was tagged "PhD" because its curriculum page names a lecturer's own
+       "PhD (2001) in Marketing", and "phd" sorts before "msc"/"master of
+       science" in DEGREE_KEYWORDS so it won. The explicit fact-bullet path
+       isn't filtered this way since "Diploma"/"Titels" bullets are short,
+       structured, and not where a bio would appear.
     """
     explicit = (explicit_value or "").lower()
     for needle, code in DEGREE_KEYWORDS:
-        if needle in explicit:
+        if _keyword_present(needle, explicit):
             return code, False
-    t = (text or "").lower()
+    t = _sentences_without_bio_cues(text or "").lower()
     for needle, code in DEGREE_KEYWORDS:
-        if needle in t:
+        if _keyword_present(needle, t):
             return code, False
     return DEFAULT_DEGREE, True
 
