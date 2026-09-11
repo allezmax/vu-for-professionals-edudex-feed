@@ -24,8 +24,8 @@ import datetime as dt
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
 
-from .mapping import normalize_enum, guess_program_level, VU_FORM_TEXT_TO_CODE, VU_TYPE_TEXT_TO_CODE, \
-    DEFAULT_PROGRAM_FORM, DEFAULT_PROGRAM_TYPE, DEFAULT_DEGREE, DEFAULT_APPLICATION_TYPE, \
+from .mapping import normalize_enum, guess_program_level, guess_degree, VU_FORM_TEXT_TO_CODE, VU_TYPE_TEXT_TO_CODE, \
+    DEFAULT_PROGRAM_FORM, DEFAULT_PROGRAM_TYPE, DEFAULT_APPLICATION_TYPE, \
     DEFAULT_PAYMENT_DUE, DEFAULT_START_DATE_DETERMINATION, FALLBACK_CONTACT_NAME, FALLBACK_CONTACT_EMAIL
 from .scrape import ScrapedProgram, _first_fact
 
@@ -122,10 +122,35 @@ def build_program_xml(
     pc = _sub(root, "programClassification")
     program_id = override.get("programId") or slugify_program_id(scraped, 0)
 
-    degree_code = override.get("degree", DEFAULT_DEGREE)
+    if "degree" in override:
+        degree_code = override["degree"]
+    else:
+        # Prefer an explicit "Diploma"/"Titels" ("Degree"/"Titles") fact bullet when the
+        # page states one (e.g. "Diploma: MSc") -- that's a real statement, not a guess.
+        # Falls back to a keyword scan of title/heading/description (catches "PhD in
+        # Business Administration", "... Master of Science ..." in the program name
+        # itself), then to the "certificate of participation" default. Per Max
+        # (2026-09-10): PhDs obviously finish with a PhD and VU runs a number of MSc
+        # programs -- defaulting every program to a certificate was wrong for those.
+        degree_fact = _first_fact(scraped.facts, "Diploma", "Degree", "Titels", "Titles")
+        # Unlike programLevel's title/heading/meta_description-only text, the degree
+        # keyword (e.g. "Master of Science (MSc)") often only appears in body copy --
+        # confirmed live 2026-09-10 on the Deeltijd Master Bedrijfskunde page, where
+        # it's a bullet under "Wat levert de Master Bedrijfskunde je op?", not in the
+        # title/heading/meta description at all -- so the body paragraphs are searched
+        # too.
+        degree_text = " ".join(filter(None, [
+            scraped.title, scraped.heading, scraped.meta_description,
+            " ".join(scraped.description_paragraphs), scraped.curriculum_text, scraped.admission_text,
+        ]))
+        degree_code, degree_needs_review = guess_degree(degree_fact, degree_text)
+        if degree_needs_review:
+            review["degree"] = (
+                f"defaulted to '{degree_code}' -- no 'Diploma'/'Titels' fact bullet and no "
+                f"PhD/MSc/MBA/DBA/LLM keyword found in title/heading/description; confirm "
+                f"what VU actually issues on completion"
+            )
     _sub(pc, "degree", degree_code)
-    if "degree" not in override:
-        review["degree"] = f"defaulted to '{degree_code}' -- confirm what VU actually issues on completion"
 
     _sub(pc, "orgUnitId", org_unit_id)
 
@@ -219,10 +244,33 @@ def build_program_xml(
         st = _sub(subj, "summaryText", scraped.admission_text[:500])
         st.set("xml:lang", lang)
 
+    # NOTE: newer-template pages have a dedicated "Dates and costs"/"Data en kosten"
+    # page (see scrape.py's SUBPAGES_BY_LANG). Its prose often carries itemized/tiered
+    # per-year pricing or a range (e.g. "Year 1 & 2: €12,000/year", "between €32.000
+    # and €34.000") that can't be safely collapsed into the single <cost><amount>
+    # below without guessing which figure is "the" price -- confirmed live
+    # 2026-09-10. Surface the raw text here so it isn't silently lost even when the
+    # single-amount parse below only captures part of the picture (e.g. the low end
+    # of a range). "tuition fee" is a real EDU-DEX subject enum value (confirmed
+    # against the live program.xsd).
+    if scraped.dates_costs_text:
+        subj = _sub(desc, "subjectText")
+        _sub(subj, "subject", "tuition fee")
+        st = _sub(subj, "summaryText", scraped.dates_costs_text[:500])
+        st.set("xml:lang", lang)
+
     # ---- programSchedule ----------------------------------------------------------------------
     schedule = _sub(root, "programSchedule")
     generic_run = _sub(schedule, "genericProgramRun")
-    price = override.get("tuitionFeeAmount") or _extract_price(_first_fact(scraped.facts, "Kosten", "Costs", "Cost"))
+    # NOTE (2026-09-10): label list expanded beyond "Kosten"/"Costs"/"Cost" -- the
+    # newer page template uses "Investering"/"Tuition fee(s)"/"Investment" instead
+    # (confirmed live on the Deeltijd Master Bedrijfskunde and EMFC/PhD-in-Finance
+    # pages). _first_fact now matches by substring, so a compound label like
+    # "Investering tweejarige master" is found too, not just an exact "Investering".
+    cost_fact_text = _first_fact(
+        scraped.facts, "Kosten", "Costs", "Cost", "Investering", "Tuition fee", "Tuition fees", "Investment"
+    )
+    price = override.get("tuitionFeeAmount") or _extract_price(cost_fact_text)
     if price is not None:
         # NOTE: costData's children are order-strict per the live XSD:
         # amount, amountIsFinal, costType, currency, isRequiredCost (others optional/omitted).
@@ -232,13 +280,23 @@ def build_program_xml(
         _sub(cost, "costType", "tuition fee")
         _sub(cost, "currency", "eur")
         _sub(cost, "isRequiredCost", "true")
+        if _looks_like_range_or_itemized(cost_fact_text):
+            review["cost"] = (
+                f"'{cost_fact_text}' looks like a range or itemized/tiered price -- "
+                f"emitted {price} eur (the first amount found), but please confirm "
+                f"against the programme's own 'Dates and costs' page"
+            )
     else:
-        review["cost"] = "could not parse a tuition-fee amount from the 'Kosten' bullet; no <cost> emitted"
+        review["cost"] = (
+            "could not parse a tuition-fee amount from any Kosten/Costs/Investering/"
+            "Tuition fee bullet; no <cost> emitted"
+            + (" -- see the 'tuition fee' subjectText for the page's raw cost text" if scraped.dates_costs_text else "")
+        )
 
     # NOTE: genericProgramRun has no <summaryText> child in the live XSD (its only
     # free-text outlet is the untyped <genericProgramRunFree>) -- start-date hints
     # that don't parse into a real date go there instead of being dropped silently.
-    start_text = override.get("startText") or _first_fact(scraped.facts, "Startdatum", "Start date", "Startdate")
+    start_text = override.get("startText") or _first_fact(scraped.facts, "Startdatum", "Start date", "Startdate", "Start")
     if start_text:
         _sub(generic_run, "genericProgramRunFree", start_text[:200])
 
@@ -272,15 +330,55 @@ def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
 
 
 def _extract_price(text: str) -> float | None:
+    """Parse the first money amount out of a cost-bullet string.
+
+    BUG FOUND 2026-09-10: the previous version (``r"([\\d.]+),?-?"``) only ever
+    treated "." as a valid separator inside the number, so on an English page
+    using comma as the thousands separator -- e.g. "Cost: €5,975" (confirmed
+    live on the "Enterprise Risk & Compliance Management" course page) -- the
+    regex stopped at the comma and returned just "5" (5.0 EUR instead of
+    5975.0). Dutch pages use the opposite convention ("€ 27.500,-" = 27500,
+    period as thousands separator, trailing ",-" meaning no cents), so any fix
+    has to handle both.
+
+    Approach: grab the first digit run (allowing embedded "." and ","), then
+    decide which trailing separator (if any) is a real decimal point rather
+    than a thousands separator by its digit count -- a separator followed by
+    exactly 1-2 digits at the very end is a decimal amount (".56", ",50");
+    followed by 3 digits it's a thousands grouping ("5,975", "7.250") and
+    every other "." or "," in the number is always a thousands separator.
+    """
     import re
-    m = re.search(r"([\d.]+),?-?", text.replace("€", "").replace("&euro;", "").strip())
+    cleaned = text.replace("€", "").replace("&euro;", "").strip()
+    m = re.search(r"\d[\d.,]*\d|\d", cleaned)
     if not m:
         return None
-    raw = m.group(1).replace(".", "")
+    raw = m.group(0)
+    decimal_match = re.search(r"[.,](\d{1,2})$", raw)
+    if decimal_match:
+        integer_part = re.sub(r"[.,]", "", raw[: decimal_match.start()])
+        normalized = f"{integer_part}.{decimal_match.group(1)}"
+    else:
+        normalized = re.sub(r"[.,]", "", raw)
     try:
-        return float(raw)
+        return float(normalized)
     except ValueError:
         return None
+
+
+def _looks_like_range_or_itemized(text: str) -> bool:
+    """True if a cost-bullet string contains more than one distinct money amount
+    (a range like "between €32.000 and €34.000", or itemized figures like
+    "€6000 / €4000") -- a single <cost><amount> can only carry one number, so
+    these need a human to confirm which figure (if any single one) is right.
+
+    Counts occurrences of the currency symbol itself rather than all digit runs
+    in the text -- a cost bullet can legitimately contain other numbers that
+    aren't part of the price at all, e.g. "€ 23.000 bij start in academisch
+    jaar 2026-2027" contains the years 2026/2027 alongside a single, perfectly
+    unambiguous amount. Only flag when more than one "€" actually appears.
+    """
+    return text.count("€") > 1
 
 
 def _to_iso_datetime(value: str) -> str:
