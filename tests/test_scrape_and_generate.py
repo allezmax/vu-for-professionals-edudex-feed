@@ -163,6 +163,34 @@ def test_guess_degree_defaults_to_certificate_when_nothing_found():
     assert needs_review is True
 
 
+def test_guess_degree_ignores_keyword_hiding_inside_an_unrelated_word():
+    # Confirmed live 2026-09-11: "Escaperoom Het Huis van Toezicht" was tagged
+    # "DBA" because a testimonial says "...persoonlijke feedback levert." --
+    # "feedback" contains the literal substring "dba" (fee-D-B-Ack). A plain
+    # substring scan can't tell that apart from a real "DBA" mention.
+    code, needs_review = guess_degree(
+        "", "Je wordt begeleid door een team dat hele goede persoonlijke feedback levert."
+    )
+    assert code == "certificate of participation"
+    assert needs_review is True
+
+
+def test_guess_degree_ignores_a_lecturers_own_credentials_in_a_bio():
+    # Confirmed live 2026-09-11: "Parttime Master of Science in Marketing" was
+    # tagged "PhD" because its curriculum page names a lecturer's own "PhD
+    # (2001) in Marketing" in a faculty bio -- and "phd" sorts before "msc"/
+    # "master of science" in DEGREE_KEYWORDS, so the bio mention won even
+    # though the program's own name clearly says "Master of Science".
+    code, needs_review = guess_degree(
+        "",
+        "Parttime Master of Science in Marketing. Zet de volgende stap in je "
+        "marketingcarriere! Hij heeft zowel een PhD (2001) in Marketing als "
+        "een MSc in Food Science, beide behaald aan Wageningen University.",
+    )
+    assert code == "MSc"
+    assert needs_review is False
+
+
 def test_degree_and_cost_wired_into_generated_xml():
     """End-to-end regression for the 2026-09-10 feedback: a program whose only
     degree signal is a body-text keyword, and whose cost lives under a compound
@@ -237,6 +265,8 @@ if __name__ == "__main__":
     test_guess_degree_prefers_explicit_diploma_fact()
     test_guess_degree_falls_back_to_body_text_keyword()
     test_guess_degree_defaults_to_certificate_when_nothing_found()
+    test_guess_degree_ignores_keyword_hiding_inside_an_unrelated_word()
+    test_guess_degree_ignores_a_lecturers_own_credentials_in_a_bio()
     test_degree_and_cost_wired_into_generated_xml()
     test_range_cost_flagged_and_raw_text_surfaced()
     print("all tests passed")
