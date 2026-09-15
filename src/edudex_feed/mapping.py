@@ -133,7 +133,7 @@ COST_TYPE = {
     "lunch": "lunch",
     "accommodation": "verblijf/overnachting",
     "second accommodation": "partnerovernachting",
-    "single payment discount": "korting bij betaling in één keer",
+    "single payment discount": "korting bij betaling in Ã©Ã©n keer",
     "cost of living": "levensonderhoud",
     "housing": "huisvesting",
     "insurance": "verzekeringen",
@@ -274,19 +274,39 @@ def _keyword_present(needle: str, haystack: str) -> bool:
 # MSc Marketing page, whose curriculum text names a lecturer's own "PhD
 # (2001) in Marketing" in a bio paragraph.
 _BIO_CUE_RE = re.compile(
-    r"\b(hij|zij|hem|haar|prof\.?|dr\.|docent|hoogleraar|onderzoeker|"
-    r"promoveerde|behaalde|professor|lecturer|researcher|holds a|"
-    r"received (his|her)|his phd|her phd)\b",
+    # A trailing \b after a literal "." never matches when followed by a space
+    # (both sides are non-word characters) -- confirmed live 2026-09-11 on "Het
+    # nieuwe Three Lines Model", whose "...onder leiding van prof. dr. ir
+    # Frederique Six MBA." was only half-filtered: "prof." matched (its "."
+    # is optional, so the engine backs off to bare "prof" for a valid trailing
+    # boundary) but "dr." did not, letting "MBA" leak through as this course's
+    # own degree. So the period-abbreviation cues below skip the trailing \b
+    # entirely -- the literal period already rules out matching inside an
+    # ordinary word ("professioneel" has no period after "prof").
+    r"\b(hij|zij|hem|haar|docent|hoogleraar|onderzoeker|promoveerde|behaalde|"
+    r"professor|lecturer|researcher|holds a|received (his|her)|his phd|her phd)\b"
+    r"|\bprof\.|\bdr\.",
     re.IGNORECASE,
 )
 
 
 def _sentences_without_bio_cues(text: str) -> str:
     """Drop sentences that read as a person's own academic-background bio
-    before the degree body-text keyword fallback searches what's left."""
+    before the degree body-text keyword fallback searches what's left.
+
+    Splits only where a sentence-ending punctuation mark is followed by a
+    capital letter, not on every ". " -- confirmed live 2026-09-11 that a
+    plain ". "-split breaks Dutch "prof. dr. ir <Name> <degree>" titles
+    apart (each abbreviation's own period looks like a sentence end), which
+    orphaned the actual bio cue ("prof."/"dr.") from the degree mention that
+    followed it on "Het nieuwe Three Lines Model" ("...onder leiding van
+    prof. dr. ir Frederique Six MBA."), letting "MBA" leak through as if it
+    were the course's own degree. Requiring a capital letter after the
+    whitespace keeps that whole title in one sentence with its cue.
+    """
     if not text:
         return text
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\u00c0-\u00de])", text)
     return " ".join(s for s in sentences if not _BIO_CUE_RE.search(s))
 
 
@@ -336,27 +356,38 @@ def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
     first (if the page states one), else a keyword guess over title/heading/description
     text, else the "certificate of participation" default.
 
-    Returns (code, needs_review) -- needs_review=False only when an explicit fact
-    bullet or an unambiguous keyword match was found; the default is always flagged,
-    same philosophy as guess_program_level.
+    Returns (code, needs_review) -- needs_review=False ONLY for an explicit fact
+    bullet match, since that's the program stating its own credential outright.
+    Every other outcome is flagged, including a body-text keyword match, even
+    though the resulting code is often still correct -- see below for why that
+    guess isn't trusted the same way guess_program_level's keyword match is.
 
-    Two precision guards, both confirmed necessary against the live 2026-09-11
-    catalog pull (which surfaced real, embarrassing false positives across
-    several non-graduate short courses):
+    Three rounds of precision problems, all confirmed live 2026-09-11 spot-
+    checking the full catalog after the degree-defaulting fix, converged on
+    that decision:
 
     1. Word-boundary matching (``_keyword_present``), not a plain substring
        check -- "Escaperoom Het Huis van Toezicht" was tagged "DBA" because
        its testimonials mention "feedback", which contains the literal
-       substring "dba" (fee-D-B-Ack). Short 3-letter codes like "dba"/"mba"/
-       "msc" collide with ordinary words often enough that this isn't a
-       corner case.
-    2. Faculty-bio filtering (``_sentences_without_bio_cues``) on the
-       body-text fallback only -- "Parttime Master of Science in Marketing"
-       was tagged "PhD" because its curriculum page names a lecturer's own
-       "PhD (2001) in Marketing", and "phd" sorts before "msc"/"master of
-       science" in DEGREE_KEYWORDS so it won. The explicit fact-bullet path
-       isn't filtered this way since "Diploma"/"Titels" bullets are short,
-       structured, and not where a bio would appear.
+       substring "dba" (fee-D-B-Ack).
+    2. Faculty-bio sentence filtering (``_sentences_without_bio_cues``) --
+       "Parttime Master of Science in Marketing" was tagged "PhD" because its
+       curriculum page names a lecturer's own "PhD (2001) in Marketing", and
+       "phd" sorts before "msc"/"master of science" in DEGREE_KEYWORDS.
+    3. Even after both of those, "Executive Master in Coaching" still came
+       out wrong two different ways from its own coaches' bios: "...vele
+       executives, (PhD) studenten en klanten..." (PhD as a type of client
+       she coaches, not a credential at all) and "...in 2015 (MSc)..." (an
+       accreditation the COACH holds, not what this programme awards) --
+       neither reads as a bio sentence in the way #2's guard looks for.
+
+    Rather than keep chasing every new phrasing body text can throw at this
+    (a body page's free-form paragraphs -- testimonials, staff bios, client
+    descriptions -- are an open-ended source of unrelated keyword mentions,
+    unlike the short structured "Diploma"/"Titels" bullet), a body-text match
+    is kept as a reasonable best guess but always flagged for a human to
+    confirm, the same conservative stance guess_program_level already takes
+    on its own considered "post-academic" default.
     """
     explicit = (explicit_value or "").lower()
     for needle, code in DEGREE_KEYWORDS:
@@ -365,7 +396,7 @@ def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
     t = _sentences_without_bio_cues(text or "").lower()
     for needle, code in DEGREE_KEYWORDS:
         if _keyword_present(needle, t):
-            return code, False
+            return code, True
     return DEFAULT_DEGREE, True
 
 
@@ -373,7 +404,7 @@ def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
 # Per VU (2026-09-08): the feed editor (m.merz@vu.nl) builds the feed but is never a
 # contact person for students/programs. When a program page has no scraped contact,
 # use this named fallback instead of the institute's technical editor address.
-FALLBACK_CONTACT_NAME = "René Hulsink"
+FALLBACK_CONTACT_NAME = "RenÃ© Hulsink"
 FALLBACK_CONTACT_EMAIL = "professionals@vu.nl"
 
 
