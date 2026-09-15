@@ -147,14 +147,19 @@ def test_guess_degree_prefers_explicit_diploma_fact():
 def test_guess_degree_falls_back_to_body_text_keyword():
     # "Master of Science (MSc)" often only appears in body copy, not the title --
     # confirmed live on the Deeltijd Master Bedrijfskunde page, where it's a bullet
-    # under "Wat levert de Master Bedrijfskunde je op?".
+    # under "Wat levert de Master Bedrijfskunde je op?". The code is still trusted,
+    # but -- unlike an explicit "Diploma:"/"Titels:" fact bullet -- a body-text
+    # match always comes back flagged for review (see guess_degree's docstring for
+    # the live 2026-09-11 catalog cases that motivated this: body text is an
+    # open-ended source of unrelated keyword mentions no amount of extra guarding
+    # fully closes off).
     code, needs_review = guess_degree("", "Een internationaal erkende Master of Science (MSc)")
     assert code == "MSc"
-    assert needs_review is False
+    assert needs_review is True
 
     code, needs_review = guess_degree("", "Part-time PhD in Finance")
     assert code == "PhD"
-    assert needs_review is False
+    assert needs_review is True
 
 
 def test_guess_degree_defaults_to_certificate_when_nothing_found():
@@ -188,7 +193,29 @@ def test_guess_degree_ignores_a_lecturers_own_credentials_in_a_bio():
         "een MSc in Food Science, beide behaald aan Wageningen University.",
     )
     assert code == "MSc"
-    assert needs_review is False
+    assert needs_review is True  # still a body-text guess -- see docstring
+
+
+def test_guess_degree_body_text_match_is_always_flagged_for_review():
+    # Confirmed live 2026-09-11: even after guarding against the two bugs above,
+    # "Executive Master in Coaching" still came out wrong from its own coaches'
+    # bios two different ways -- "...vele executives, (PhD) studenten en
+    # klanten..." (PhD names a type of client she coaches, not a credential) and
+    # "...in 2015 (MSc)..." (an accreditation the COACH holds, not what this
+    # programme awards) -- neither phrased as a bio sentence the way the guard
+    # above looks for. Rather than keep chasing every new phrasing, a body-text
+    # match is always flagged for review, even when (as here) it happens to
+    # come out wrong outright, or (as in the tests above) it happens to be
+    # right -- only an explicit "Diploma"/"Titels" fact bullet is trusted
+    # without review.
+    code, needs_review = guess_degree(
+        "",
+        "Ze heeft als coach en mentor vele executives, (PhD) studenten en "
+        "klanten kunnen helpen persoonlijke doelen te bereiken in hun werk "
+        "of studie. Marjan is door Ashridge Hult geaccrediteerd als "
+        "executive coach in 2015 (MSc).",
+    )
+    assert needs_review is True
 
 
 def test_degree_and_cost_wired_into_generated_xml():
@@ -218,7 +245,7 @@ def test_degree_and_cost_wired_into_generated_xml():
 
     assert degree == "MSc"
     assert float(cost_amount) == 23000.0
-    assert "degree" not in review
+    assert "degree" in review  # body-text match, always flagged -- see guess_degree's docstring
     assert "cost" not in review
 
 
@@ -267,6 +294,7 @@ if __name__ == "__main__":
     test_guess_degree_defaults_to_certificate_when_nothing_found()
     test_guess_degree_ignores_keyword_hiding_inside_an_unrelated_word()
     test_guess_degree_ignores_a_lecturers_own_credentials_in_a_bio()
+    test_guess_degree_body_text_match_is_always_flagged_for_review()
     test_degree_and_cost_wired_into_generated_xml()
     test_range_cost_flagged_and_raw_text_surfaced()
     print("all tests passed")
