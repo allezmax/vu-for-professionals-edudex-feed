@@ -110,6 +110,11 @@ def run(config_path: Path, overrides_path: Path, feed_dir: Path, report_dir: Pat
     )
 
     write_report(report_dir / "report.md", discovered, all_reviews)
+    # Also publish the same report next to the feed itself (Max, 2026-09-15),
+    # so it's visible at a stable, no-login-required URL
+    # (.../feed/report.md on GitHub Pages) instead of only as a GitHub
+    # Actions run artifact, which needs repo access to open.
+    write_report(feed_dir / "report.md", discovered, all_reviews)
 
     log.info("validating feed against live EDU-DEX XSDs...")
     problems = validate.validate_feed_dir(feed_dir)
