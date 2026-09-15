@@ -227,7 +227,7 @@ DEFAULT_PROGRAM_FORM = "part-time"
 DEFAULT_PROGRAM_TYPE = "regular"
 DEFAULT_DEGREE = "certificate of participation"
 DEFAULT_APPLICATION_TYPE = "individual"
-DEFAULT_PAYMENT_DUE = "up-front"
+DEFAULT_PAYMENT_DUE = "installments"
 DEFAULT_START_DATE_DETERMINATION = "fixed starting date"
 
 # --- programClassification > programLevel guessing ----------------------------------------
