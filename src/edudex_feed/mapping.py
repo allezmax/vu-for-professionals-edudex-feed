@@ -133,7 +133,7 @@ COST_TYPE = {
     "lunch": "lunch",
     "accommodation": "verblijf/overnachting",
     "second accommodation": "partnerovernachting",
-    "single payment discount": "korting bij betaling in Ã©Ã©n keer",
+    "single payment discount": "korting bij betaling in één keer",
     "cost of living": "levensonderhoud",
     "housing": "huisvesting",
     "insurance": "verzekeringen",
@@ -404,7 +404,7 @@ def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
 # Per VU (2026-09-08): the feed editor (m.merz@vu.nl) builds the feed but is never a
 # contact person for students/programs. When a program page has no scraped contact,
 # use this named fallback instead of the institute's technical editor address.
-FALLBACK_CONTACT_NAME = "RenÃ© Hulsink"
+FALLBACK_CONTACT_NAME = "René Hulsink"
 FALLBACK_CONTACT_EMAIL = "professionals@vu.nl"
 
 
