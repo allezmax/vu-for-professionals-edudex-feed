@@ -105,10 +105,12 @@ def build_program_xml(
     app_type_code = override.get("applicationType", DEFAULT_APPLICATION_TYPE)
     _sub(pa, "applicationType", app_type_code)
 
+    # Per Max (2026-09-15): every VU for Professionals programme is paid in
+    # installments ("in termijnen") -- this is a confirmed constant, not a
+    # guess, so (unlike the other defaults below) it's no longer flagged for
+    # review. An explicit override still wins for the rare exception.
     payment_due_code = override.get("paymentDue", DEFAULT_PAYMENT_DUE)
     _sub(pa, "paymentDue", payment_due_code)
-    if "paymentDue" not in override:
-        review["paymentDue"] = f"defaulted to '{payment_due_code}' -- not stated on the page, confirm with finance/PDO"
 
     start_date_code = override.get("startDateDetermination", DEFAULT_START_DATE_DETERMINATION)
     _sub(pa, "startDateDetermination", start_date_code)
@@ -155,7 +157,7 @@ def build_program_xml(
     _sub(pc, "orgUnitId", org_unit_id)
 
     duration_value, duration_unit = _extract_duration(_first_fact(scraped.facts, "Duur", "Duration"), override)
-    dur_el = _sub(pc, "programDuration", str(duration_value))
+    dur_el = _sub(pc, "programDuration", str(duration_value if duration_value is not None else 1))
     dur_el.set("unit", duration_unit)
     if duration_value is None:
         review["programDuration"] = "could not parse a duration from the page; defaulted to 1 month"
@@ -180,7 +182,10 @@ def build_program_xml(
             )
     _sub(pc, "programLevel", level_code)
 
-    location = override.get("programLocation") or "Amsterdam"
+    # Per Max (2026-09-15): every programme runs at VU Campus Amsterdam (some
+    # hybrid, none fully online), so this is a confirmed constant rather than
+    # a guess.
+    location = override.get("programLocation") or "VU Campus Amsterdam"
     _sub(pc, "programLocation", location)
 
     type_text = override.get("programType") or (scraped.title or "")
@@ -272,18 +277,29 @@ def build_program_xml(
     )
     price = override.get("tuitionFeeAmount") or _extract_price(cost_fact_text)
     if price is not None:
+        # An explicit tuitionFeeAmount override is taken as the final total
+        # already -- only a figure we scraped ourselves gets the per-period
+        # multiplication (Max, 2026-09-15: "if there is no addition added
+        # like per year, per module or whatever you can just copy/paste").
+        if "tuitionFeeAmount" in override:
+            final_price, period_note = price, None
+        else:
+            final_price, period_note = _apply_cost_period(price, cost_fact_text, duration_value, duration_unit)
+
         # NOTE: costData's children are order-strict per the live XSD:
         # amount, amountIsFinal, costType, currency, isRequiredCost (others optional/omitted).
         cost = _sub(generic_run, "cost")
-        _sub(cost, "amount", str(price))
+        _sub(cost, "amount", str(final_price))
         _sub(cost, "amountIsFinal", "true")
         _sub(cost, "costType", "tuition fee")
         _sub(cost, "currency", "eur")
         _sub(cost, "isRequiredCost", "true")
-        if _looks_like_range_or_itemized(cost_fact_text):
+        if period_note:
+            review["cost"] = period_note
+        elif _looks_like_range_or_itemized(cost_fact_text):
             review["cost"] = (
                 f"'{cost_fact_text}' looks like a range or itemized/tiered price -- "
-                f"emitted {price} eur (the first amount found), but please confirm "
+                f"emitted {final_price} eur (the first amount found), but please confirm "
                 f"against the programme's own 'Dates and costs' page"
             )
     else:
@@ -315,7 +331,17 @@ def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
         text.lower(),
     )
     if not m:
-        return 1, "month"
+        # BUG FOUND 2026-09-15: this used to return (1, "month") here, an
+        # ordinary-looking value indistinguishable from a real 1-month
+        # programme -- which silently defeated the "programDuration"
+        # needs_review flag above (duration_value was never actually None,
+        # so that check never fired, even on the ~40/66 catalog programmes
+        # that have no parseable duration at all). Returning None makes a
+        # genuine parse failure distinguishable from a real value, and also
+        # lets the cost x duration multiplication below (Max, 2026-09-15)
+        # recognise "duration unknown" rather than silently multiplying by a
+        # bogus 1 month.
+        return None, "month"
     value = int(m.group(1))
     unit_word = m.group(2)
     if unit_word.startswith("dag") or unit_word.startswith("day"):
@@ -364,6 +390,81 @@ def _extract_price(text: str) -> float | None:
         return float(normalized)
     except ValueError:
         return None
+
+
+_DURATION_UNIT_TO_MONTHS = {"day": 1 / 30, "week": 0.25, "month": 1, "year": 12}
+
+# Only periods we can actually convert against programDuration. Any other
+# "per X" phrasing (per module, per keer/session, per persoon...) is real
+# data we can't safely total without more information (e.g. a module count
+# this feed doesn't have), so it's surfaced for a human instead of guessed.
+_KNOWN_COST_PERIODS = {
+    "jaar": "year", "jaren": "year", "year": "year", "years": "year",
+    "maand": "month", "maanden": "month", "month": "month", "months": "month",
+    "week": "week", "weken": "week", "weeks": "week",
+}
+_PER_PERIOD_RE = None  # set below (compiled once, after `re` is imported)
+
+
+def _cost_period_word(text: str) -> str | None:
+    """Return the literal period word following "per"/"p/" in a cost bullet
+    (e.g. "jaar" in "Kosten: € 9.750 per jaar"), or None if the bullet states
+    a flat one-off amount with no recurring period at all."""
+    import re
+    global _PER_PERIOD_RE
+    if _PER_PERIOD_RE is None:
+        _PER_PERIOD_RE = re.compile(r"\bper\s+([a-zëïüö]+)\b", re.I)
+    m = _PER_PERIOD_RE.search(text.lower())
+    return m.group(1) if m else None
+
+
+def _apply_cost_period(
+    price: float, cost_text: str, duration_value: int | None, duration_unit: str
+) -> tuple[float, str | None]:
+    """Scale a per-period tuition amount (e.g. "€ 9.750 per jaar") up to a
+    total for the whole programme using the parsed programDuration.
+
+    Per Max (2026-09-15): a cost bullet with no "per X" wording at all is
+    already a one-off total and should be copied as-is; anything stated per
+    year/module/whatever needs to be turned into a real total rather than
+    reported as the bare per-period figure. Returns (amount_to_emit,
+    review_note_or_None) -- a note is only set when the multiplication
+    couldn't be done with confidence, so the raw scraped figure is still
+    emitted but flagged for a human to check.
+    """
+    period_word = _cost_period_word(cost_text)
+    if period_word is None:
+        return price, None  # flat one-off total -- copy as-is
+
+    period_unit = _KNOWN_COST_PERIODS.get(period_word)
+    if period_unit is None:
+        return price, (
+            f"'{cost_text}' is priced per {period_word}, which this feed doesn't know how to "
+            f"total automatically -- emitted the raw per-{period_word} amount ({price}); please "
+            f"confirm the real total or add a 'tuitionFeeAmount' override with the full figure"
+        )
+
+    if duration_value is None:
+        return price, (
+            f"cost is priced per {period_word} ('{cost_text}') but no programme duration could be "
+            f"parsed to multiply it by -- emitted the raw per-{period_word} amount, please verify the total"
+        )
+
+    duration_in_months = duration_value * _DURATION_UNIT_TO_MONTHS[duration_unit]
+    period_in_months = _DURATION_UNIT_TO_MONTHS[period_unit]
+    multiplier = duration_in_months / period_in_months
+    total = round(price * multiplier, 2)
+
+    note = None
+    if abs(multiplier - round(multiplier)) > 0.05:
+        # e.g. a "per jaar" cost on a programme whose duration didn't parse
+        # to a clean number of years -- still multiplied, but worth a look.
+        note = (
+            f"programDuration ({duration_value} {duration_unit}) isn't a clean multiple of the "
+            f"'per {period_word}' cost period -- multiplied anyway ({price} x {multiplier:.2f} = {total}), "
+            f"please verify"
+        )
+    return total, note
 
 
 def _looks_like_range_or_itemized(text: str) -> bool:
