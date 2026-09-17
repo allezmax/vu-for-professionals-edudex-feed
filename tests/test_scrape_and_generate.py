@@ -141,6 +141,25 @@ def test_first_fact_matches_compound_labels_by_substring():
     assert _first_fact(facts, "Kosten", "Costs", "Cost", "Investering") == facts["Investering tweejarige master"]
 
 
+def test_first_fact_does_not_match_search_term_fused_onto_another_word():
+    """BUG FOUND 2026-09-17: plain substring matching also matched a search
+    term glued onto the END of an unrelated Dutch compound word --
+    "Investering" (looking for the tuition-cost bullet) matched inside
+    "Tijdsinvestering" ("time investment"), confirmed live on the CMA page,
+    where "Tijdsinvestering: 8-10 uur per week" appears before the real
+    "Investering: ..." bullet and so won outright, emitting an hours-per-week
+    figure as the tuition fee. The needle must start a real word -- not be
+    preceded by another letter -- to match."""
+    facts = {
+        "Tijdsinvestering": "8-10 uur per week",
+        "Investering": "€ 1.900 per deel",
+    }
+    assert _first_fact(facts, "Kosten", "Costs", "Cost", "Investering") == "€ 1.900 per deel"
+
+    facts_reiskosten = {"Reiskosten": "wordt vergoed", "Kosten": "€ 5.000"}
+    assert _first_fact(facts_reiskosten, "Kosten") == "€ 5.000"
+
+
 def test_guess_degree_prefers_explicit_diploma_fact():
     # "Diploma: MSc" (confirmed live on the EMFC/Controllersopleiding page) is a
     # real statement, not a guess -- should win over any keyword scan.
@@ -376,6 +395,21 @@ def test_extract_duration_returns_none_on_failed_parse():
     assert _extract_duration("2 jaar (deeltijd)", {}) == (2, "year")
 
 
+def test_extract_duration_handles_dutch_weken_plural():
+    """BUG FOUND 2026-09-17: the old regex looked for "week" + optional "en",
+    i.e. "weeken", but the real Dutch plural is "weken" (single "e") -- Dutch
+    spelling drops one letter of the doubled vowel once the syllable opens up
+    in the plural ("week" -> "we-ken"). That silently defeated the regex on
+    every programme whose duration is stated in weeks, the single most common
+    Dutch phrasing -- confirmed live on the Certified Management Accountant
+    (CMA) page ("Duur: 15 weken per deel (deeltijd)"), which fell back to
+    "could not parse a duration" despite a perfectly well-formed fact bullet."""
+    assert _extract_duration("15 weken per deel (deeltijd)", {}) == (15, "week")
+    assert _extract_duration("6 weken", {}) == (6, "week")
+    assert _extract_duration("1 week", {}) == (1, "week")
+    assert _extract_duration("20 weeks", {}) == (20, "week")
+
+
 def test_program_duration_flagged_and_defaulted_when_unparseable():
     p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/verandermanagement")
     p.title = "Verandermanagement"
@@ -420,6 +454,7 @@ if __name__ == "__main__":
     test_extract_price_handles_english_and_dutch_thousands_separators()
     test_looks_like_range_or_itemized_ignores_unrelated_numbers()
     test_first_fact_matches_compound_labels_by_substring()
+    test_first_fact_does_not_match_search_term_fused_onto_another_word()
     test_guess_degree_prefers_explicit_diploma_fact()
     test_guess_degree_falls_back_to_body_text_keyword()
     test_guess_degree_defaults_to_certificate_when_nothing_found()
@@ -434,6 +469,7 @@ if __name__ == "__main__":
     test_cost_per_period_flagged_when_duration_unknown()
     test_tuition_fee_override_is_not_multiplied()
     test_extract_duration_returns_none_on_failed_parse()
+    test_extract_duration_handles_dutch_weken_plural()
     test_program_duration_flagged_and_defaulted_when_unparseable()
     test_program_location_defaults_to_vu_campus_amsterdam()
     print("all tests passed")
