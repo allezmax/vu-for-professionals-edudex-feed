@@ -326,8 +326,24 @@ def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
     # Dutch and English unit words, singular/plural, both mapping to the same
     # EDU-DEX unit codes -- course pages can be scraped in either language
     # (see scrape.py's stub-page/hreflang fallback).
+    #
+    # BUG FOUND 2026-09-17: "week(?:en)?" assumed the Dutch plural was simply
+    # "week" + "en" ("weeken"), but Dutch spelling shortens the doubled vowel
+    # when the syllable opens up in the plural -- "week" (closed syllable,
+    # long "ee") becomes "we-ken" (open syllable) once pluralized, so the real
+    # word is "weken" with a SINGLE "e", not "weeken". That silently defeated
+    # the regex on every program whose duration is stated in weeks -- by far
+    # the most common Dutch phrasing (e.g. "Duur: 15 weken per deel") -- and
+    # was confirmed live on the Certified Management Accountant (CMA) page,
+    # which fell back to "could not parse a duration" despite a perfectly
+    # well-formed "Duur: 15 weken per deel (deeltijd)" fact bullet. "jaar" ->
+    # "jaren" already gets the same special-cased treatment below for the
+    # analogous reason; "maand" -> "maanden" and "dag" -> "dagen" don't need
+    # it because those words end in a two-consonant cluster (nd) or a short
+    # vowel, which Dutch syllabification keeps closed, so the plain
+    # concatenation is already correct there.
     m = re.search(
-        r"(\d+)\s*(dag(?:en)?|week(?:en)?|maand(?:en)?|jaar|jaren|day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)",
+        r"(\d+)\s*(dag(?:en)?|weken|week|maand(?:en)?|jaar|jaren|day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)",
         text.lower(),
     )
     if not m:
@@ -344,9 +360,16 @@ def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
         return None, "month"
     value = int(m.group(1))
     unit_word = m.group(2)
-    if unit_word.startswith("dag") or unit_word.startswith("day"):
+    # NOTE: can't use unit_word.startswith("week") here -- "weken" (the plural
+    # matched above) genuinely does NOT start with "week" (weken[:4] == "weke",
+    # not "week"; see the BUG FOUND note above), so that check silently fell
+    # through to the "else: year" bucket below, same as it happens to work by
+    # accident for "jaar"/"jaren" (neither starts with the other either).
+    # Matching against the exact word set the regex above can produce avoids
+    # relying on any prefix relationship at all.
+    if unit_word in ("dag", "dagen", "day", "days"):
         unit = "day"
-    elif unit_word.startswith("week"):
+    elif unit_word in ("week", "weken", "weeks"):
         unit = "week"
     elif unit_word.startswith("maand") or unit_word.startswith("month"):
         unit = "month"
