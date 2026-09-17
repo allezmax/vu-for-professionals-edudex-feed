@@ -227,11 +227,24 @@ def _first_fact(facts: dict[str, str], *labels: str) -> str:
     and a pre-master cost line) this returns whichever came first -- on every
     real page checked so far that's the standard/full-track figure, since the
     pre-master or discount line is always listed second.
+
+    BUG FOUND 2026-09-17: plain substring matching also matches a search term
+    glued onto the END of an unrelated Dutch compound word -- "Investering"
+    (looking for the tuition-cost bullet) matched inside "Tijdsinvestering"
+    ("time investment", e.g. "8-10 uur per week"), confirmed live on the CMA
+    page, where that "Tijdsinvestering" bullet happens to appear before the
+    real "Investering" bullet in page order and so won it outright, emitting
+    an hours-per-week figure as if it were the tuition fee. The fix requires
+    the needle to start a "word" -- i.e. not be immediately preceded by
+    another letter -- which still matches a search term used as a real prefix
+    ("Investering tweejarige master") or standalone ("Kosten"), but no longer
+    matches it fused onto a preceding word ("Tijdsinvestering", "Reiskosten").
     """
     for label in labels:
-        needle = label.lower()
+        needle = re.escape(label.lower())
+        pattern = re.compile(r"(?:^|[^a-zA-Zëïüö])" + needle)
         for key, value in facts.items():
-            if needle in key.lower():
+            if pattern.search(key.lower()):
                 return value
     return ""
 
