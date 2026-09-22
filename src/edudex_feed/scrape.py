@@ -249,6 +249,81 @@ def _first_fact(facts: dict[str, str], *labels: str) -> str:
     return ""
 
 
+# Icon class -> synthetic fact label for the "USP bar" (VU's own term is
+# "technical study details") shown directly below the hero image on program
+# pages, e.g. "Leergang / Opleiding" / "Nederlands" / "9 maanden (deeltijd, 7
+# dagen)" -- confirmed live 2026-09-22 (Max: "often the USP bar contains key
+# information", flagged after reviewing the Sept 18 export). Structure
+# confirmed live: <div data-widget="technical-study-details"> containing one
+# <div class="vuw-icon-block"> per icon, each with an <i class="fal fa-..."> +
+# a <span> holding the value text -- no <li>/"Label: value" bullet form at
+# all, so this needed its own parser entirely separate from FACT_LINE_RE.
+#
+# These are given their own "USP-*" fact keys (rather than trying to guess
+# which real label they correspond to) and merged in LAST, after every other
+# fact source on the page, so _first_fact's "first match in page order wins"
+# rule naturally treats them as a fallback: an explicit "Duur:"/"Vorm:"
+# bullet elsewhere on the page always wins over the USP bar's own duration
+# text when both exist. Confirmed live this is often the ONLY structured
+# fact source at all -- e.g. Business Analytics for Industry's overview page
+# has no "in het kort" bullet list whatsoever, just this bar (whose duration
+# reads "8 full days" -- see xmlgen.py's _extract_duration for the matching
+# "number + adjective + unit" phrasing fix this motivated).
+_USP_ICON_TO_FACT_LABEL = {
+    "fa-books": "USP-Type",
+    "fa-globe-africa": "USP-Taal",
+    "fa-calendar": "USP-Duur",
+    "fa-medal": "USP-ECTS",
+}
+
+
+def _parse_usp_bar(soup: BeautifulSoup, program: ScrapedProgram) -> None:
+    bar = soup.select_one('[data-widget="technical-study-details"]')
+    if not bar:
+        return
+    for block in bar.select(".vuw-icon-block"):
+        icon = block.select_one("i")
+        span = block.select_one("span")
+        if not icon or not span:
+            continue
+        icon_classes = icon.get("class") or []
+        label = next((lbl for cls, lbl in _USP_ICON_TO_FACT_LABEL.items() if cls in icon_classes), None)
+        if not label:
+            continue
+        value = span.get_text(strip=True)
+        if value:
+            program.facts[label] = value
+
+
+def _parse_accordion_facts(soup: BeautifulSoup, program: ScrapedProgram) -> None:
+    """Extract label/value facts from the "Praktische informatie" accordion
+    widget used by a THIRD page-template variant -- confirmed live 2026-09-22
+    on Besturen van Filantropische Fondsen's /data-en-kosten page, whose
+    "Kosten"/"Locatie"/"Diploma"/etc sections are each a collapsed accordion
+    item rather than a "<Label>: <value>" bullet (FACT_LINE_RE) or dates-and-
+    costs prose paragraph (see SUBPAGES_BY_LANG). Structure confirmed live:
+    <li class="accordion-item"> whose label is an <h3> inside a nested
+    <a class="accordion-title">, and whose value is free-text rich content
+    inside a sibling <div class="accordion-content"> -- collapsed
+    (aria-hidden="true") in the browser, but present in the raw server-
+    rendered HTML regardless (see this module's top-level docstring), so
+    BeautifulSoup sees it whether or not a person ever clicks it open.
+
+    Uses setdefault, same as the sub-page fact merge in scrape_program below,
+    so an accordion item never overrides a fact already found in a plain
+    "<Label>: <value>" bullet list -- it only fills gaps.
+    """
+    for item in soup.select("li.accordion-item"):
+        h3 = item.select_one(".accordion-title h3")
+        content = item.select_one(".accordion-content")
+        if not h3 or not content:
+            continue
+        label = h3.get_text(strip=True)
+        value = content.get_text(" ", strip=True)
+        if label and value:
+            program.facts.setdefault(label, value)
+
+
 def _parse_main_body(soup: BeautifulSoup, program: ScrapedProgram) -> None:
     title_bar = soup.select_one('[data-widget="title-bar"]')
     if title_bar:
@@ -272,6 +347,12 @@ def _parse_main_body(soup: BeautifulSoup, program: ScrapedProgram) -> None:
             if m:
                 label, value = m.group(1).strip(), m.group(2).strip()
                 program.facts[label] = value
+
+    # USP bar and accordion facts are parsed AFTER the plain bullet list
+    # above so that, per _parse_usp_bar's docstring, they only ever fill
+    # gaps rather than winning over a real "Duur:"/"Kosten:" bullet.
+    _parse_usp_bar(soup, program)
+    _parse_accordion_facts(soup, program)
 
     contact_widget = soup.select_one('[data-widget="contact"]')
     if contact_widget:
@@ -395,6 +476,14 @@ def scrape_program(session: requests.Session, base_url: str, slow_down: float = 
                 if m:
                     label, value = m.group(1).strip(), m.group(2).strip()
                     program.facts.setdefault(label, value)
+
+        # The "Praktische informatie" accordion (see _parse_accordion_facts)
+        # lives on the /data-en-kosten sub-page, not the overview page, on
+        # every case confirmed live so far -- e.g. Besturen van Filantropische
+        # Fondsen. setdefault inside that function already keeps a same-named
+        # fact found earlier (overview page, or an earlier sub-page in this
+        # loop) from being overwritten.
+        _parse_accordion_facts(sub_soup, program)
 
         # A /toelating page often repeats/extends contact info; only fill gaps.
         if program.contact_email is None:
