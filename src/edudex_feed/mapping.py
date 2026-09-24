@@ -203,6 +203,15 @@ VU_FORM_TEXT_TO_CODE = {
     "deeltijd": "part-time",
     "duaal": "dual",
     "avond": "evening education",
+    # English equivalents -- NOTE (2026-09-22): this table previously had no
+    # English entries at all, so an English page's own form text (e.g. the
+    # new "technical study details" USP-bar duration line, "4+ years
+    # (part-time)" -- see scrape.py's _parse_usp_bar) could never actually
+    # MATCH here; it happened to still come out right by falling through to
+    # DEFAULT_PROGRAM_FORM ("part-time"), but silently flagged for review as
+    # an unverified guess even when the page said so in plain English.
+    "part-time": "part-time",
+    "full-time": "full-time",
 }
 
 VU_TYPE_TEXT_TO_CODE = {
@@ -273,6 +282,32 @@ def _keyword_present(needle: str, haystack: str) -> bool:
 # program awards its students -- confirmed live 2026-09-11 on the Parttime
 # MSc Marketing page, whose curriculum text names a lecturer's own "PhD
 # (2001) in Marketing" in a bio paragraph.
+#
+# UPDATE 2026-09-22 (Max, reviewing the Sept 18 export): reconfirmed with two
+# more concrete cases, both docent bios under "Executive Master in Coaching"
+# and "Digital Innovation & Transformation" / "Data- en AI-gedreven Sturing"
+# (the latter two share the same lecturer bio block, Dr. Marijn Plomp, reused
+# across several programme pages). Neither was caught by the cue list below
+# as it stood:
+#   - "Ze heeft als coach en mentor vele executives, (PhD) studenten en
+#     klanten kunnen helpen..." -- uses "Ze" (the common informal Dutch
+#     "she"), not "zij", which wasn't in the cue list at all.
+#   - "Marjan is door Ashridge Hult geaccrediteerd als executive coach in
+#     2015 (MSc)..." -- names the person by her first name instead of a
+#     pronoun, so no pronoun cue could ever have caught it; "geaccrediteerd"
+#     (accredited) is the actual tell here -- a credential someone is
+#     *accredited with*, not one the programme awards its students.
+#   - "Marijn heeft een PhD in Information Systems aan de Universiteit
+#     Utrecht, op basis van zijn proefschrift..." -- uses "zijn" (his),
+#     likewise absent from the cue list ("hij" was there, "zijn" wasn't).
+# Added "ze", "zijn", "geaccrediteerd" and "accredited" below. "zijn" is also
+# the ordinary Dutch verb "to be" (extremely common), so this will drop a lot
+# of unrelated sentences from the body-text scan too -- that's fine here:
+# this text is a last-resort keyword guess that's always flagged for human
+# review anyway (see guess_degree's docstring), so being more willing to drop
+# a sentence only ever makes the guess MORE conservative, never wrong in a
+# new way; the worst case is falling through to the safe
+# "certificate of participation" default instead of finding a real keyword.
 _BIO_CUE_RE = re.compile(
     # A trailing \b after a literal "." never matches when followed by a space
     # (both sides are non-word characters) -- confirmed live 2026-09-11 on "Het
@@ -283,11 +318,17 @@ _BIO_CUE_RE = re.compile(
     # own degree. So the period-abbreviation cues below skip the trailing \b
     # entirely -- the literal period already rules out matching inside an
     # ordinary word ("professioneel" has no period after "prof").
-    r"\b(hij|zij|hem|haar|docent|hoogleraar|onderzoeker|promoveerde|behaalde|"
-    r"professor|lecturer|researcher|holds a|received (his|her)|his phd|her phd)\b"
+    r"\b(hij|zij|ze|zijn|hem|haar|docent|hoogleraar|onderzoeker|promoveerde|behaalde|"
+    r"professor|lecturer|researcher|holds a|received (his|her)|his phd|her phd|"
+    r"geaccrediteerd|accredited)\b"
     r"|\bprof\.|\bdr\.",
     re.IGNORECASE,
 )
+
+# Title abbreviations that can appear standalone, immediately before a
+# capitalized name, e.g. "Dr. Marijn Plomp" -- see the BUG FOUND note inside
+# _sentences_without_bio_cues below for why these need special handling.
+_TITLE_ABBREV_RE = re.compile(r"\b(prof|dr|ir|mr|drs|ing)\.$", re.IGNORECASE)
 
 
 def _sentences_without_bio_cues(text: str) -> str:
@@ -303,10 +344,34 @@ def _sentences_without_bio_cues(text: str) -> str:
     prof. dr. ir Frederique Six MBA."), letting "MBA" leak through as if it
     were the course's own degree. Requiring a capital letter after the
     whitespace keeps that whole title in one sentence with its cue.
+
+    BUG FOUND 2026-09-22: that fix isn't enough for a STANDALONE title
+    abbreviation immediately followed by a name -- "Dr. Marijn Plomp" (its
+    own short line/paragraph introducing a docent bio) -- because the split
+    condition (period, then whitespace, then a capital letter) is exactly
+    what "Dr. Marijn" looks like too, so it gets cut into its own fragment
+    the same way a real sentence boundary would. Confirmed live on Digital
+    Innovation & Transformation's and Data- en AI-gedreven Sturing's /inhoud
+    pages, both of which introduce the same reused lecturer bio with a
+    standalone "Dr. Marijn Plomp" line right before "Marijn heeft een PhD in
+    Information Systems...": once "Dr." was split off into its own fragment,
+    the sentence stating his PhD had no bio cue left in it at all, and "PhD"
+    leaked through as if it were this course's own awarded degree. Fix: merge
+    a fragment that ends in a bare title abbreviation back onto the sentence
+    that immediately follows it before running the bio-cue filter, rather
+    than trying to stop them from splitting apart in the first place (the
+    "capital letter follows" condition above still has to stay, since that's
+    what keeps "prof. dr. ir Name" together when nothing else does).
     """
     if not text:
         return text
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\u00c0-\u00de])", text)
+    raw_sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\u00c0-\u00de])", text)
+    sentences: list[str] = []
+    for s in raw_sentences:
+        if sentences and _TITLE_ABBREV_RE.search(sentences[-1].strip()):
+            sentences[-1] = sentences[-1] + " " + s
+        else:
+            sentences.append(s)
     return " ".join(s for s in sentences if not _BIO_CUE_RE.search(s))
 
 
@@ -393,6 +458,18 @@ def guess_degree(explicit_value: str, text: str) -> tuple[str, bool]:
     for needle, code in DEGREE_KEYWORDS:
         if _keyword_present(needle, explicit):
             return code, False
+    # NOTE (2026-09-22): a generic "u ontvangt een diploma" ("you'll receive
+    # a diploma") statement -- no MSc/MBA/etc qualifier at all -- is also an
+    # explicit statement, just a plainer one than the abbreviations above.
+    # Confirmed live on Besturen van Filantropische Fondsen's "Diploma"
+    # accordion section ("Je ontvangt na afloop van de opleiding een
+    # diploma."), a newer page-template variant (see scrape.py's
+    # _parse_accordion_facts) that previously had no degree signal at all and
+    # fell all the way to the certificate-of-participation default. Checked
+    # only against the explicit fact bullet, not body text -- "diploma" on
+    # its own is too generic a word to trust as a body-text keyword guess.
+    if _keyword_present("diploma", explicit):
+        return "diploma", False
     t = _sentences_without_bio_cues(text or "").lower()
     for needle, code in DEGREE_KEYWORDS:
         if _keyword_present(needle, t):
