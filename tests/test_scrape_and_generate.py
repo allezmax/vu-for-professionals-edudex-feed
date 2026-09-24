@@ -16,9 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bs4 import BeautifulSoup
 from edudex_feed.mapping import guess_degree
-from edudex_feed.scrape import ScrapedProgram, _parse_head, _parse_main_body, _first_fact
+from edudex_feed.scrape import (
+    ScrapedProgram, _parse_head, _parse_main_body, _first_fact, _parse_usp_bar, _parse_accordion_facts,
+)
 from edudex_feed.xmlgen import (
     build_program_xml, _extract_price, _looks_like_range_or_itemized, _extract_duration, _apply_cost_period,
+    _select_cost_text, _prefer_total_over_per_unit_amount, _detect_program_location,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "basisopleiding-verandermanagement.html"
@@ -444,6 +447,306 @@ def test_program_location_defaults_to_vu_campus_amsterdam():
     assert location == "VU Campus Amsterdam"
 
 
+# --- Round 6 (2026-09-22): USP bar, accordion template, cost-selection policy, ---------------
+# --- location detection, and PhD-degree bio-cue fixes ----------------------------------------
+# All confirmed live against real vu.nl pages while implementing Max's Sept 18 export feedback
+# (18 threaded Excel comments across rows 2-20, plus his sign-off to generalise the recurring
+# patterns to all 66 programmes -- see claude/edudex-feed.md's Round 6 section).
+
+USP_BAR_HTML = """
+<div data-widget="technical-study-details">
+  <div class="grid-x">
+    <div class="cell vuw-icon-block"><i class="fal fal fa-books vuw-text-primary-1"></i><div><span>Leergang / Opleiding</span></div></div>
+    <div class="cell vuw-icon-block"><i class="fal fal fa-globe-africa vuw-text-primary-1"></i><div><span>Nederlands</span></div></div>
+    <div class="cell vuw-icon-block"><i class="fal fal fa-calendar vuw-text-primary-1"></i><div><span>9 maanden (deeltijd, 7 dagen)</span></div></div>
+  </div>
+</div>
+"""
+
+ACCORDION_HTML = """
+<ul>
+<li class="accordion-item" data-accordion-item>
+  <a href="#" class="accordion-title" aria-expanded="false"><i class="fal fa-arrow-right"></i><h3>Kosten</h3></a>
+  <div class="accordion-content" aria-hidden="true"><div class="vuw-rich-text"><p>&euro; 2.900,- <em>(vrij van BTW).</em></p></div></div>
+</li>
+<li class="accordion-item" data-accordion-item>
+  <a href="#" class="accordion-title" aria-expanded="false"><i class="fal fa-arrow-right"></i><h3>Locatie</h3></a>
+  <div class="accordion-content" aria-hidden="true"><div class="vuw-rich-text"><p>NU-gebouw, De Boelelaan 1111, Amsterdam.</p></div></div>
+</li>
+<li class="accordion-item" data-accordion-item>
+  <a href="#" class="accordion-title" aria-expanded="false"><i class="fal fa-arrow-right"></i><h3>Diploma</h3></a>
+  <div class="accordion-content" aria-hidden="true"><div class="vuw-rich-text"><p>Je ontvangt na afloop van de opleiding een diploma.</p></div></div>
+</li>
+</ul>
+"""
+
+
+def test_parse_usp_bar_extracts_icon_blocks_as_facts():
+    """Confirmed live 2026-09-22 on 'De strategische griffier' -- the USP bar
+    below the hero image (Max: "often the USP bar contains key information")
+    has no <li>"Label: value" bullet form at all, just an <i> icon class +
+    <span> text pair per block, so it needs its own parser."""
+    soup = BeautifulSoup(USP_BAR_HTML, "html.parser")
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/de-strategische-griffier")
+    _parse_usp_bar(soup, p)
+    assert p.facts["USP-Type"] == "Leergang / Opleiding"
+    assert p.facts["USP-Taal"] == "Nederlands"
+    assert p.facts["USP-Duur"] == "9 maanden (deeltijd, 7 dagen)"
+
+
+def test_usp_bar_facts_do_not_override_a_real_fact_bullet():
+    """The USP bar is a fallback, not an authority -- an explicit "Duur:"
+    bullet from the "in het kort" list must still win over the USP bar's own
+    duration line when both exist on the same page."""
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/voorbeeld")
+    p.facts["Duur"] = "4 maanden"
+    _parse_usp_bar(BeautifulSoup(USP_BAR_HTML, "html.parser"), p)
+    assert _first_fact(p.facts, "Duur", "Duration") == "4 maanden"
+
+
+def test_parse_accordion_facts_extracts_label_and_value():
+    """Confirmed live 2026-09-22 on Besturen van Filantropische Fondsen's
+    /data-en-kosten page -- a THIRD page-template variant whose "Kosten"/
+    "Locatie"/"Diploma"/etc sections are each a collapsed accordion item
+    (aria-hidden="true" in the browser, but present in the raw server-
+    rendered HTML regardless) rather than a "<Label>: <value>" bullet."""
+    soup = BeautifulSoup(ACCORDION_HTML, "html.parser")
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/besturen-van-filantropische-fondsen")
+    _parse_accordion_facts(soup, p)
+    assert p.facts["Kosten"] == "€ 2.900,- (vrij van BTW)."
+    assert p.facts["Locatie"] == "NU-gebouw, De Boelelaan 1111, Amsterdam."
+    assert p.facts["Diploma"] == "Je ontvangt na afloop van de opleiding een diploma."
+
+
+def test_program_type_and_form_fall_back_to_usp_bar_when_no_fact_list_exists():
+    """Confirmed live 2026-09-22 on Business Analytics for Industry, which
+    has NO "in het kort" bullet list at all -- the USP bar is the only
+    structured fact source on the whole page."""
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/business-analytics-for-industry")
+    p.title = "Business Analytics for Industry"
+    p.heading = p.title
+    p.content_language = "en"
+    p.facts = {"USP-Type": "Cursus / Training", "USP-Taal": "Engels", "USP-Duur": "8 full days"}
+
+    element, review = build_program_xml(
+        p, org_unit_id="vu", editor_email="edudex@vu.nl", generator_name="test", expires_in_days=21, override={},
+    )
+    reparsed = ET.fromstring(ET.tostring(element, encoding="utf-8"))
+    ns = "{http://studieData.nl/schema/edudex/program}"
+    pc = reparsed.find(f"{ns}programClassification")
+    duration = pc.find(f"{ns}programDuration")
+
+    assert duration.text == "8" and duration.get("unit") == "day"
+    assert pc.find(f"{ns}programType").text == "regular"
+    assert "programType" not in review  # USP-Type "Cursus / Training" matched outright
+
+
+def test_program_type_prefers_usp_bar_over_a_title_with_no_type_keyword():
+    """Confirmed live 2026-09-22: "De strategische griffier" has no type
+    keyword in its title/heading at all, so it used to fall to the
+    unverified 'regular' default -- but its USP bar says "Leergang /
+    Opleiding" outright, VU's own classification stated in so many words."""
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/de-strategische-griffier")
+    p.title = "De strategische griffier"
+    p.heading = p.title
+    p.content_language = "nl"
+    p.facts = {"USP-Type": "Leergang / Opleiding", "USP-Taal": "Nederlands", "USP-Duur": "9 maanden (deeltijd, 7 dagen)"}
+
+    element, review = build_program_xml(
+        p, org_unit_id="vu", editor_email="edudex@vu.nl", generator_name="test", expires_in_days=21, override={},
+    )
+    reparsed = ET.fromstring(ET.tostring(element, encoding="utf-8"))
+    ns = "{http://studieData.nl/schema/edudex/program}"
+    pc = reparsed.find(f"{ns}programClassification")
+
+    assert pc.find(f"{ns}programType").text == "regular"
+    assert "programType" not in review
+    # bonus: the USP-bar duration text also carries "deeltijd", so programForm
+    # comes out matched (not defaulted+flagged) even with no "Vorm:" bullet.
+    assert pc.find(f"{ns}programForm").text == "part-time"
+    assert "programForm" not in review
+
+
+def test_extract_duration_handles_a_trailing_plus_sign():
+    """BUG FOUND 2026-09-22: "4+ years (part-time)" (confirmed live on the
+    USP bar of Part-time PhD in Finance) didn't match at all -- \\s* can't
+    skip over a literal "+" between the digit and the unit word."""
+    assert _extract_duration("4+ years (part-time)", {}) == (4, "year")
+
+
+def test_extract_duration_handles_an_adjective_between_number_and_unit():
+    """BUG FOUND 2026-09-22: "8 full days" (confirmed live on the USP bar of
+    Business Analytics for Industry, which has no other duration source on
+    the whole page) didn't match either -- the unit word had to immediately
+    follow the number with only whitespace in between."""
+    assert _extract_duration("8 full days", {}) == (8, "day")
+    assert _extract_duration("6 hele weken", {}) == (6, "week")
+
+
+def test_select_cost_text_prefers_regular_price_over_early_bird_discount():
+    """Confirmed live 2026-09-22 on Data- en AI-gedreven Sturing in de
+    Publieke Sector, whose "in het kort" list states both as two SEPARATE
+    bullets. Per Max (2026-09-22): the regular price is the one to feed the
+    feed with, not whichever bullet happens to come first on the page."""
+    facts = {
+        "Startdatum": "eind maart 2027",
+        "Duur": "kennismakingsochtend en 8 collegedagen",
+        "Prijs": "vroegboekkorting vóór 1 januari 2027: € 4.950,-",
+        "Reguliere prijs vanaf 2027": "€ 5.250,-",
+        "Lesvorm": "klassikaal",
+    }
+    assert _select_cost_text(facts) == "€ 5.250,-"
+    assert _extract_price(_select_cost_text(facts)) == 5250.0
+
+
+def test_select_cost_text_recognises_prijs_and_price_labels():
+    """BUG FOUND 2026-09-22: "Kosten"/"Costs"/"Investering"/"Tuition fee(s)"/
+    "Investment" were the only recognised cost labels -- "Prijs" (confirmed
+    live on multiple pages, e.g. Beleidscontrol, Actualiteitenlezingen
+    Pensioenrecht) wasn't matched by any of them, so cost silently came out
+    empty on every page that only ever says "Prijs"."""
+    assert _select_cost_text({"Prijs": "€ 4.995 (vrijgesteld van btw)"}) == "€ 4.995 (vrijgesteld van btw)"
+    assert _select_cost_text({"Price": "€ 1.000"}) == "€ 1.000"
+    assert _select_cost_text({"Onderwerp": "niets relevants"}) == ""
+
+
+def test_prefer_total_over_per_unit_amount_picks_the_series_total():
+    """Confirmed live 2026-09-22 on Actualiteitenlezingen Pensioenrecht,
+    whose single "Prijs" bullet states both a per-unit and a per-4-units
+    price in the same string. Per Max (2026-09-22): prefer the stated total/
+    series price over the stated per-unit price."""
+    text = "per lezing: €325,- (geen btw). Prijs per 4 lezingen: €1.105,- (geen btw)."
+    rewritten = _prefer_total_over_per_unit_amount(text)
+    assert _extract_price(rewritten) == 1105.0
+
+
+def test_prefer_total_over_per_unit_amount_leaves_flat_prices_unchanged():
+    assert _prefer_total_over_per_unit_amount("€ 5.250,-") == "€ 5.250,-"
+    assert _prefer_total_over_per_unit_amount("€ 9.750 per jaar") == "€ 9.750 per jaar"
+
+
+def test_actualiteitenlezingen_pensioenrecht_end_to_end_cost():
+    """End-to-end regression combining both cost-policy fixes: the "Prijs"
+    label must be found at all, and the per-4-lezingen total (not the bare
+    per-lezing figure, and not the stray "4" itself) must be what's emitted,
+    with no spurious 'priced per lezing' review note now that the chosen
+    text no longer contains any 'per X' wording of its own."""
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/actualiteitenlezingen-pensioenrecht")
+    p.title = "Actualiteitenlezingen Pensioenrecht"
+    p.heading = p.title
+    p.content_language = "nl"
+    p.facts = {
+        "Prijs": "per lezing: €325,- (geen btw). Prijs per 4 lezingen: €1.105,- (geen btw).",
+        "Locatie": "de lezingen vinden plaats in het NU.VU gebouw (nieuwe universiteitsgebouw) van de Vrije Universiteit.",
+    }
+
+    element, review = build_program_xml(
+        p, org_unit_id="vu", editor_email="edudex@vu.nl", generator_name="test", expires_in_days=21, override={},
+    )
+    reparsed = ET.fromstring(ET.tostring(element, encoding="utf-8"))
+    ns = "{http://studieData.nl/schema/edudex/program}"
+    cost_amount = reparsed.find(f"{ns}programSchedule/{ns}genericProgramRun/{ns}cost/{ns}amount").text
+
+    assert float(cost_amount) == 1105.0
+    assert "cost" not in review
+
+
+def test_detect_program_location_finds_confirmed_off_campus_exception():
+    """Confirmed live 2026-09-22: Beleidscontrol runs "bij de Rijksacademie
+    in Den Haag" -- Max: "I was surprised myself that we offered a course
+    elsewhere." The venue text lives inside the *Duur* fact bullet on this
+    page template, not a dedicated "Locatie" bullet."""
+    facts = {"Duur": "6 dagen van 9.30 – 16.30 uur; bij de Rijksacademie in Den Haag"}
+    location, needs_review = _detect_program_location(facts)
+    assert location == "bij de Rijksacademie in Den Haag"
+    assert needs_review is True
+
+
+def test_detect_program_location_does_not_flag_the_default_amsterdam_venue():
+    """A dedicated "Locatie" fact (from the accordion template) that just
+    restates the default building must NOT be treated as an exception --
+    confirmed live on Besturen van Filantropische Fondsen."""
+    facts = {"Locatie": "NU-gebouw, De Boelelaan 1111, Amsterdam. De ervaring leert dat kennisoverdracht..."}
+    location, needs_review = _detect_program_location(facts)
+    assert location == "VU Campus Amsterdam"
+    assert needs_review is False
+
+    location, needs_review = _detect_program_location({})
+    assert location == "VU Campus Amsterdam"
+    assert needs_review is False
+
+
+def test_program_location_override_still_wins_over_detection():
+    """A human-confirmed override in overrides.yaml must still take priority
+    over the heuristic detector -- e.g. Beleidscontrol's own confirmed,
+    cleanly-worded override, once added, should no longer be flagged."""
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/beleidscontrol")
+    p.title = "Beleidscontrol"
+    p.heading = p.title
+    p.content_language = "nl"
+    p.facts = {"Duur": "6 dagen van 9.30 – 16.30 uur; bij de Rijksacademie in Den Haag"}
+
+    element, review = build_program_xml(
+        p, org_unit_id="vu", editor_email="edudex@vu.nl", generator_name="test", expires_in_days=21,
+        override={"programLocation": "Rijksacademie, Den Haag"},
+    )
+    reparsed = ET.fromstring(ET.tostring(element, encoding="utf-8"))
+    ns = "{http://studieData.nl/schema/edudex/program}"
+    location = reparsed.find(f"{ns}programClassification/{ns}programLocation").text
+
+    assert location == "Rijksacademie, Den Haag"
+    assert "programLocation" not in review
+
+
+def test_guess_degree_catches_informal_ze_pronoun_and_accreditation_cue():
+    """BUG FOUND 2026-09-22 (Max, reconfirming the PhD false-positive with
+    concrete evidence): "Ze" (informal Dutch "she"/"they") wasn't in the
+    pronoun cue list at all (only "zij" was), and "Marjan is door Ashridge
+    Hult geaccrediteerd als executive coach in 2015 (MSc)" names the person
+    by her first name instead of any pronoun -- "geaccrediteerd" is the real
+    tell there. Confirmed live on Executive Master in Coaching's own coach
+    bios, both of which leaked through as this course's own awarded degree
+    before this fix (PhD and then MSc, depending on which fix was applied)."""
+    code, needs_review = guess_degree(
+        "",
+        "Ze heeft als coach en mentor vele executives, (PhD) studenten en "
+        "klanten kunnen helpen persoonlijke doelen te bereiken in hun werk "
+        "of studie. Marjan is door Ashridge Hult geaccrediteerd als "
+        "executive coach in 2015 (MSc).",
+    )
+    assert code == "certificate of participation"
+    assert needs_review is True
+
+
+def test_guess_degree_merges_standalone_title_abbreviation_into_next_sentence():
+    """BUG FOUND 2026-09-22: a standalone "Dr. Marijn Plomp" line (introducing
+    a docent bio) gets cut apart from the sentence that follows it by the
+    sentence-splitter (its period + a following capital letter looks exactly
+    like a sentence boundary), so "Dr." was gone by the time the bio-cue
+    filter checked the sentence that actually states his PhD. Confirmed live
+    on Digital Innovation & Transformation's and Data- en AI-gedreven
+    Sturing's /inhoud pages, which both reuse this same lecturer bio."""
+    code, needs_review = guess_degree(
+        "",
+        "Digital Innovation & Transformation. Dr. Marijn Plomp Marijn heeft "
+        "een PhD in Information Systems aan de Universiteit Utrecht, op "
+        "basis van zijn proefschrift over digitale innovatieprocessen.",
+    )
+    assert code == "certificate of participation"
+    assert needs_review is True
+
+
+def test_guess_degree_recognises_generic_diploma_accordion_fact():
+    """Confirmed live 2026-09-22 on Besturen van Filantropische Fondsen's
+    "Diploma" accordion section (see scrape.py's _parse_accordion_facts) --
+    a generic "you'll receive a diploma" statement with no MSc/MBA/etc
+    qualifier, previously not recognised as a degree signal at all and so
+    fell all the way to the certificate-of-participation default."""
+    code, needs_review = guess_degree("Je ontvangt na afloop van de opleiding een diploma.", "")
+    assert code == "diploma"
+    assert needs_review is False
+
+
 if __name__ == "__main__":
     test_head_fields()
     test_facts_extracted()
@@ -472,4 +775,22 @@ if __name__ == "__main__":
     test_extract_duration_handles_dutch_weken_plural()
     test_program_duration_flagged_and_defaulted_when_unparseable()
     test_program_location_defaults_to_vu_campus_amsterdam()
+    test_parse_usp_bar_extracts_icon_blocks_as_facts()
+    test_usp_bar_facts_do_not_override_a_real_fact_bullet()
+    test_parse_accordion_facts_extracts_label_and_value()
+    test_program_type_and_form_fall_back_to_usp_bar_when_no_fact_list_exists()
+    test_program_type_prefers_usp_bar_over_a_title_with_no_type_keyword()
+    test_extract_duration_handles_a_trailing_plus_sign()
+    test_extract_duration_handles_an_adjective_between_number_and_unit()
+    test_select_cost_text_prefers_regular_price_over_early_bird_discount()
+    test_select_cost_text_recognises_prijs_and_price_labels()
+    test_prefer_total_over_per_unit_amount_picks_the_series_total()
+    test_prefer_total_over_per_unit_amount_leaves_flat_prices_unchanged()
+    test_actualiteitenlezingen_pensioenrecht_end_to_end_cost()
+    test_detect_program_location_finds_confirmed_off_campus_exception()
+    test_detect_program_location_does_not_flag_the_default_amsterdam_venue()
+    test_program_location_override_still_wins_over_detection()
+    test_guess_degree_catches_informal_ze_pronoun_and_accreditation_cue()
+    test_guess_degree_merges_standalone_title_abbreviation_into_next_sentence()
+    test_guess_degree_recognises_generic_diploma_accordion_fact()
     print("all tests passed")
