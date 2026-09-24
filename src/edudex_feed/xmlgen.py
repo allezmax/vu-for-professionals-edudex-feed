@@ -162,7 +162,16 @@ def build_program_xml(
     if duration_value is None:
         review["programDuration"] = "could not parse a duration from the page; defaulted to 1 month"
 
-    form_text = override.get("programForm") or _first_fact(scraped.facts, "Vorm", "Form")
+    # NOTE (2026-09-22): falls back to the USP bar's own duration/form line
+    # (e.g. "9 maanden (deeltijd, 7 dagen)", "4+ years (part-time)") when the
+    # page has no explicit "Vorm:"/"Form:" bullet at all -- confirmed live on
+    # Business Analytics for Industry, which has no "in het kort" list
+    # whatsoever, just the USP bar (see scrape.py's _parse_usp_bar).
+    form_text = (
+        override.get("programForm")
+        or _first_fact(scraped.facts, "Vorm", "Form")
+        or _first_fact(scraped.facts, "USP-Duur")
+    )
     form_code, matched = normalize_enum(form_text, VU_FORM_TEXT_TO_CODE, DEFAULT_PROGRAM_FORM)
     _sub(pc, "programForm", form_code)
     if not matched:
@@ -182,13 +191,40 @@ def build_program_xml(
             )
     _sub(pc, "programLevel", level_code)
 
-    # Per Max (2026-09-15): every programme runs at VU Campus Amsterdam (some
-    # hybrid, none fully online), so this is a confirmed constant rather than
-    # a guess.
-    location = override.get("programLocation") or "VU Campus Amsterdam"
+    # Per Max (2026-09-15): every VU for Professionals programme runs at VU
+    # Campus Amsterdam (some hybrid, none fully online) 99% of the time, so
+    # that stays a confirmed constant default. UPDATE (Max, 2026-09-22,
+    # reviewing the Sept 18 export): Beleidscontrol is a confirmed exception
+    # -- it runs "bij de Rijksacademie in Den Haag", not on VU's own campus
+    # ("I was surprised myself that we offered a course elsewhere"). Rather
+    # than hardcode a second constant, _detect_program_location looks for
+    # this kind of explicit off-campus venue mention in the page's own text,
+    # so a *future* exception has a chance of being caught automatically too
+    # -- but it's a narrow, explicit allowlist (see that function's
+    # docstring), not a general city-name scanner, so it stays flagged for
+    # review rather than silently trusted the way the plain default is.
+    if "programLocation" in override:
+        location = override["programLocation"]
+    else:
+        location, location_needs_review = _detect_program_location(scraped.facts)
+        if location_needs_review:
+            review["programLocation"] = (
+                f"detected a non-default venue mention ('{location}') in the page's own "
+                f"text instead of the usual VU Campus Amsterdam -- please confirm"
+            )
     _sub(pc, "programLocation", location)
 
-    type_text = override.get("programType") or (scraped.title or "")
+    # NOTE (2026-09-22): the USP bar's own type line (e.g. "Leergang /
+    # Opleiding", "PhD", "Cursus / Training" -- see scrape.py's
+    # _parse_usp_bar) is VU's own classification stated in so many words, so
+    # it's tried before falling back to scanning the free-form title -- a
+    # title like "De strategische griffier" has no type keyword in it at all,
+    # even though its USP bar says "Leergang / Opleiding" outright.
+    type_text = (
+        override.get("programType")
+        or _first_fact(scraped.facts, "USP-Type")
+        or (scraped.title or "")
+    )
     type_code, matched = normalize_enum(type_text, VU_TYPE_TEXT_TO_CODE, DEFAULT_PROGRAM_TYPE)
     _sub(pc, "programType", type_code)
     if not matched:
@@ -272,9 +308,12 @@ def build_program_xml(
     # (confirmed live on the Deeltijd Master Bedrijfskunde and EMFC/PhD-in-Finance
     # pages). _first_fact now matches by substring, so a compound label like
     # "Investering tweejarige master" is found too, not just an exact "Investering".
-    cost_fact_text = _first_fact(
-        scraped.facts, "Kosten", "Costs", "Cost", "Investering", "Tuition fee", "Tuition fees", "Investment"
-    )
+    # NOTE (2026-09-22): _select_cost_text also recognises "Prijs"/"Price" labels
+    # now (see its docstring), and prefers a "reguliere prijs" bullet over an
+    # early-bird one when a page states both; _prefer_total_over_per_unit_amount
+    # then prefers a stated package/series total over a per-unit figure within
+    # whichever bullet was chosen.
+    cost_fact_text = _prefer_total_over_per_unit_amount(_select_cost_text(scraped.facts))
     price = override.get("tuitionFeeAmount") or _extract_price(cost_fact_text)
     if price is not None:
         # An explicit tuitionFeeAmount override is taken as the final total
@@ -305,7 +344,7 @@ def build_program_xml(
     else:
         review["cost"] = (
             "could not parse a tuition-fee amount from any Kosten/Costs/Investering/"
-            "Tuition fee bullet; no <cost> emitted"
+            "Tuition fee/Prijs/Price bullet; no <cost> emitted"
             + (" -- see the 'tuition fee' subjectText for the page's raw cost text" if scraped.dates_costs_text else "")
         )
 
@@ -342,8 +381,20 @@ def _extract_duration(text: str, override: dict) -> tuple[int | None, str]:
     # it because those words end in a two-consonant cluster (nd) or a short
     # vowel, which Dutch syllabification keeps closed, so the plain
     # concatenation is already correct there.
+    # NOTE (2026-09-22): allow an optional trailing "+" right after the digit
+    # ("4+ years") and an optional adjective word between the number and the
+    # unit ("8 full days") -- both confirmed live on the USP bar (see
+    # scrape.py's _parse_usp_bar), which this fact-lookup now also reads via
+    # _first_fact's substring matching ("USP-Duur" contains "Duur"). Neither
+    # phrasing matched the old regex at all: "4+ years" because \s* can't
+    # skip over the literal "+", and "8 full days" because the unit word
+    # wasn't allowed to be separated from the number by anything but
+    # whitespace, so both fell all the way through to "could not parse a
+    # duration" (confirmed live on Part-time PhD in Finance and Business
+    # Analytics for Industry respectively).
     m = re.search(
-        r"(\d+)\s*(dag(?:en)?|weken|week|maand(?:en)?|jaar|jaren|day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)",
+        r"(\d+)\+?\s*(?:full\s+|hele\s+|volledige\s+)?"
+        r"(dag(?:en)?|weken|week|maand(?:en)?|jaar|jaren|day(?:s)?|week(?:s)?|month(?:s)?|year(?:s)?)",
         text.lower(),
     )
     if not m:
@@ -439,6 +490,135 @@ def _cost_period_word(text: str) -> str | None:
         _PER_PERIOD_RE = re.compile(r"\bper\s+([a-zëïüö]+)\b", re.I)
     m = _PER_PERIOD_RE.search(text.lower())
     return m.group(1) if m else None
+
+
+# --- cost fact/bullet selection (2026-09-22) -----------------------------------------------
+# "Kosten"/"Costs"/"Cost"/"Investering"/"Tuition fee(s)"/"Investment" were the
+# only recognised cost labels until now -- "Prijs"/"Price" is at least as
+# common on VU's own pages and wasn't matched by any of those, confirmed live
+# on both the Data- en AI-gedreven Sturing and Actualiteitenlezingen
+# Pensioenrecht pages (neither has a "Kosten"-style label anywhere -- only
+# "Prijs" -- so cost silently came out empty on both before this fix).
+_COST_LABELS = (
+    "Kosten", "Costs", "Cost", "Investering", "Tuition fee", "Tuition fees", "Investment", "Prijs", "Price",
+)
+
+
+def _select_cost_text(facts: dict) -> str:
+    """Pick which cost-labelled fact to price the programme from, when a page
+    states more than one.
+
+    Per Max (2026-09-22): when a page states both an early-bird/discount
+    price and a "reguliere prijs"/"regular price" as two SEPARATE bullets --
+    confirmed live on Data- en AI-gedreven Sturing, whose "in het kort" list
+    has both "Prijs: vroegboekkorting voor 1 januari 2027: EUR 4.950,-" and
+    "Reguliere prijs vanaf 2027: EUR 5.250,-" as distinct bullets -- the
+    regular price is the one to feed the feed with, not whichever happens to
+    come first on the page. (A single bullet stating both a per-unit and a
+    per-package/series total -- e.g. Actualiteitenlezingen Pensioenrecht's
+    "per lezing: ... Prijs per 4 lezingen: ..." -- is a different, WITHIN-
+    bullet policy; see _prefer_total_over_per_unit_amount for that one.)
+
+    Falls back to the first matching bullet in page order (same rule
+    _first_fact already uses) when no bullet mentions "regulier"/"regular"
+    at all -- e.g. a page with only one cost-labelled bullet, or one that
+    only ever states the discount price.
+    """
+    import re
+    matches = []  # [(label, value), ...] in page order
+    for label, value in facts.items():
+        for cost_label in _COST_LABELS:
+            needle = re.escape(cost_label.lower())
+            if re.search(r"(?:^|[^a-zA-Zëïüö])" + needle, label.lower()):
+                matches.append((label, value))
+                break
+    if not matches:
+        return ""
+    regular = [
+        value for label, value in matches
+        if re.search(r"regulier|regular", label, re.I) or re.search(r"regulier|regular", value, re.I)
+    ]
+    return regular[0] if regular else matches[0][1]
+
+
+_PER_MULTI_UNIT_RE = None  # set below (compiled once, after `re` is imported)
+
+
+def _prefer_total_over_per_unit_amount(text: str) -> str:
+    """When a single cost bullet states both a per-single-unit price and a
+    per-N-units (N>1) price -- confirmed live on Actualiteitenlezingen
+    Pensioenrecht: "Prijs: per lezing: EUR 325,- (geen btw). Prijs per 4
+    lezingen: EUR 1.105,- (geen btw)." -- return just the per-N-units amount,
+    so _extract_price (which always grabs the first money amount in the
+    string) picks up the real package/series total instead of the per-unit
+    figure that happens to come first.
+
+    Per Max (2026-09-22): prefer a stated total/series price over a stated
+    per-unit price. Returns only the matched money amount (not the whole "per
+    4 lezingen: ..." clause) -- including the leading "4" would otherwise
+    give _extract_price two digit runs to choose from and it would grab the
+    "4" itself instead of the real amount that follows it.
+
+    Returns the input unchanged when no such "per <N> <unit>: <amount>"
+    pattern is found (the overwhelmingly common case of a single flat price,
+    or a single per-period price with nothing to prefer it over).
+    """
+    import re
+    global _PER_MULTI_UNIT_RE
+    if _PER_MULTI_UNIT_RE is None:
+        _PER_MULTI_UNIT_RE = re.compile(r"per\s+(\d+)\s+\w+[^€$\d]*([€$]\s?[\d.,]+)", re.IGNORECASE)
+    m = _PER_MULTI_UNIT_RE.search(text)
+    if m and int(m.group(1)) > 1:
+        return m.group(2)
+    return text
+
+
+# --- programLocation detection (2026-09-22) ------------------------------------------------
+# Only a handful of known non-Amsterdam venues are recognised -- Max
+# confirmed the VU Campus Amsterdam default is right "99% of the time" and
+# only one exception has been found so far (Beleidscontrol), so this stays a
+# narrow, explicit allowlist rather than a general city-name scanner, which
+# would be far more likely to misfire on a hometown mentioned in someone's
+# testimonial or contact address than to earn its keep.
+_KNOWN_OFF_CAMPUS_VENUES = ("rijksacademie", "den haag", "the hague")
+_OFF_CAMPUS_LOCATION_RE = None  # set below (compiled once, after `re` is imported)
+
+
+def _detect_program_location(facts: dict) -> tuple[str, bool]:
+    """Real per-page programLocation, falling back to the confirmed VU Campus
+    Amsterdam default.
+
+    Confirmed live 2026-09-22: Beleidscontrol runs "bij de Rijksacademie in
+    Den Haag", not on VU's own campus -- Max: "I was surprised myself that we
+    offered a course elsewhere." That text lives inside the *Duur* fact
+    bullet on this (older) page template ("Duur: 6 dagen van 9.30 - 16.30
+    uur; bij de Rijksacademie in Den Haag"), not a dedicated "Locatie"
+    bullet -- so both are checked. The newer accordion-based template (see
+    scrape.py's _parse_accordion_facts, e.g. Besturen van Filantropische
+    Fondsen) DOES have a dedicated "Locatie" section, checked first, but that
+    one confirmed live just restates the default building ("NU-gebouw, De
+    Boelelaan 1111, Amsterdam") so it correctly does NOT trigger an override.
+
+    Returns (location, needs_review) -- needs_review=False for the plain
+    default (a confirmed constant per Max, 2026-09-15, not a guess), True
+    for a detected exception (a heuristic extraction, however narrow, still
+    worth a human double-checking).
+    """
+    import re
+    global _OFF_CAMPUS_LOCATION_RE
+    if _OFF_CAMPUS_LOCATION_RE is None:
+        _OFF_CAMPUS_LOCATION_RE = re.compile(r"\bbij\s+(?:de|het)\s+[^;.\n]+", re.IGNORECASE)
+
+    candidate = " ".join(filter(None, [
+        _first_fact(facts, "Locatie", "Location"),
+        _first_fact(facts, "Duur", "Duration"),
+    ]))
+    lowered = candidate.lower()
+    if any(venue in lowered for venue in _KNOWN_OFF_CAMPUS_VENUES):
+        m = _OFF_CAMPUS_LOCATION_RE.search(candidate)
+        if m:
+            return m.group(0).strip(), True
+    return "VU Campus Amsterdam", False
 
 
 def _apply_cost_period(
