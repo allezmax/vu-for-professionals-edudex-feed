@@ -1,0 +1,18 @@
+# Manual corrections/confirmations per program, keyed by programId (the VU
+# vu:id when the page has one, else the URL slug -- see xmlgen.py's
+# slugify_program_id). Anything set here always wins over a scraped or
+# guessed value; see main.py for how this is loaded and applied.
+#
+# This file starts with exactly one entry: Beleidscontrol is a confirmed
+# exception to the "every programme runs at VU Campus Amsterdam" default
+# (Max, 2026-09-22, reviewing the Sept 18 export: "I was surprised myself
+# that we offered a course elsewhere"). xmlgen.py's _detect_program_location
+# also catches this heuristically from the page's own "Duur" bullet text
+# ("... bij de Rijksacademie in Den Haag"), which is enough on its own to get
+# the right venue into the feed -- but it's a heuristic extraction and always
+# flagged for review, so this override gives the confirmed, cleanly-worded
+# final value and takes it out of the "needs a human to check" report
+# permanently.
+programs:
+  187975ea-312a-44ba-af61-60c00f0078a5:  # Beleidscontrol
+    programLocation: "Rijksacademie, Den Haag"
