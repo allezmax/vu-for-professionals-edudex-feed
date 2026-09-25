@@ -747,6 +747,44 @@ def test_guess_degree_recognises_generic_diploma_accordion_fact():
     assert needs_review is False
 
 
+def test_contact_override_wins_over_a_scraped_contact():
+    """BUG FOUND 2026-09-24: contactName/contactEmail overrides used to only
+    take effect when the scraper found NO contact at all (`scraped.contact_name
+    or override.get("contactName")`) -- unlike every other override key, where
+    the override always wins. That silently made a contactName/contactEmail
+    override dead code the moment a page had (or later gained) any scraped
+    contact of its own. Uses the fixture, which has a real scraped contact
+    (pdo.vm.sbe@vu.nl / Lilian Dekker), to confirm the override now wins."""
+    p = load_fixture()
+    assert p.contact_email  # sanity: fixture really does have a scraped contact
+    element, review = build_program_xml(
+        p, org_unit_id="vu", editor_email="edudex@vu.nl", generator_name="test", expires_in_days=21,
+        override={"contactName": "Program Desk", "contactEmail": "programdesk@vu.nl"},
+    )
+    reparsed = ET.fromstring(ET.tostring(element, encoding="utf-8"))
+    ns = "{http://studieData.nl/schema/edudex/program}"
+    contact_data = reparsed.find(f"{ns}programContacts/{ns}contactData")
+    assert contact_data.find(f"{ns}contactName").text == "Program Desk"
+    assert contact_data.find(f"{ns}email").text == "programdesk@vu.nl"
+    assert "programContacts" not in review
+
+
+def test_contact_fallback_still_used_when_neither_scrape_nor_override_has_one():
+    p = ScrapedProgram(url="https://vu.nl/nl/onderwijs/professionals/cursussen-opleidingen/no-contact-page")
+    p.title = "No Contact Page"
+    element, review = build_program_xml(
+        p, org_unit_id="vu", editor_email="edudex@vu.nl", generator_name="test", expires_in_days=21,
+        override={},
+    )
+    reparsed = ET.fromstring(ET.tostring(element, encoding="utf-8"))
+    ns = "{http://studieData.nl/schema/edudex/program}"
+    contact_data = reparsed.find(f"{ns}programContacts/{ns}contactData")
+    from edudex_feed.mapping import FALLBACK_CONTACT_NAME, FALLBACK_CONTACT_EMAIL
+    assert contact_data.find(f"{ns}contactName").text == FALLBACK_CONTACT_NAME
+    assert contact_data.find(f"{ns}email").text == FALLBACK_CONTACT_EMAIL
+    assert "programContacts" in review
+
+
 if __name__ == "__main__":
     test_head_fields()
     test_facts_extracted()
@@ -793,4 +831,6 @@ if __name__ == "__main__":
     test_guess_degree_catches_informal_ze_pronoun_and_accreditation_cue()
     test_guess_degree_merges_standalone_title_abbreviation_into_next_sentence()
     test_guess_degree_recognises_generic_diploma_accordion_fact()
+    test_contact_override_wins_over_a_scraped_contact()
+    test_contact_fallback_still_used_when_neither_scrape_nor_override_has_one()
     print("all tests passed")
