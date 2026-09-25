@@ -234,14 +234,25 @@ def build_program_xml(
     # NOTE: the feed editor (editor_email, m.merz@vu.nl) builds/maintains the feed but is
     # never a contact person for students or programs -- per VU (2026-09-08), when a page
     # has no scraped contact this MUST fall back to a named contact, not the editor address.
+    #
+    # BUG FOUND 2026-09-24: this used to read `scraped.contact_name or
+    # override.get("contactName")`, i.e. a scraped value always won over an
+    # override -- unlike every other override key in this file, where the
+    # override always wins (see overrides.yaml's own header: "Anything set
+    # here always wins over a scraped or guessed value"). That meant a
+    # contactName/contactEmail override only ever took effect on a page the
+    # scraper found NO contact on at all -- if the page later gained (or
+    # already had) a different scraped contact, the override was silently
+    # dead code, never actually reaching the feed. Flipped to override-first
+    # to match every other field and the documented contract.
     contacts = _sub(root, "programContacts")
     contact_data = _sub(contacts, "contactData")
-    _sub(contact_data, "contactName", scraped.contact_name or override.get("contactName") or FALLBACK_CONTACT_NAME)
-    _sub(contact_data, "email", scraped.contact_email or override.get("contactEmail") or FALLBACK_CONTACT_EMAIL)
+    _sub(contact_data, "contactName", override.get("contactName") or scraped.contact_name or FALLBACK_CONTACT_NAME)
+    _sub(contact_data, "email", override.get("contactEmail") or scraped.contact_email or FALLBACK_CONTACT_EMAIL)
     _sub(contact_data, "role", scraped.contact_role or "informatie")
     if scraped.contact_phone:
         _sub(contact_data, "telephone", scraped.contact_phone)
-    if not scraped.contact_email:
+    if not scraped.contact_email and not override.get("contactEmail"):
         review["programContacts"] = (
             f"no contact email found on the page; used the fallback contact "
             f"({FALLBACK_CONTACT_NAME} / {FALLBACK_CONTACT_EMAIL})"
