@@ -1,0 +1,33 @@
+# Program-manager sign-off tracking, keyed by programId (same id as
+# overrides.yaml -- the VU vu:id when the page has one, else the URL slug).
+#
+# This is separate from overrides.yaml: overrides.yaml supplies/corrects a
+# value, this file records that a program manager with real domain knowledge
+# has actually looked at the feed's current output for that program and
+# signed off on it.
+#
+# Each entry needs exactly two fields, both filled in by hand:
+#   approvedBy:  who approved it (free text, e.g. "Jane Doe")
+#   approvedAt:  date of approval, YYYY-MM-DD
+#
+# Do NOT add an "approvedHash" field yourself -- the pipeline computes and
+# tracks that on its own (published in feed/snapshot.json, not in this git
+# file, since the build workflow never writes back to the repo). The first
+# run after approvedBy/approvedAt appears (or changes -- a re-approval)
+# fingerprints that run's actual field values as the approved baseline.
+# Every later run recomputes the fingerprint and compares: if the feed's
+# values for that program have since moved -- whether because the live page
+# changed or because someone edited overrides.yaml -- the approval
+# automatically flips to "needs re-review" in report.md, with no edit to
+# this file required. This is intentional (confirmed with Max, 2026-09-24):
+# an approval only ever certifies the exact values it was given for.
+#
+# This file starts empty. Add an entry per program as program managers sign
+# off on it, e.g.:
+#
+# programs:
+#   187975ea-312a-44ba-af61-60c00f0078a5:  # Beleidscontrol
+#     approvedBy: "Jane Doe"
+#     approvedAt: "2026-09-24"
+
+programs: {}
