@@ -97,12 +97,14 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import sys
           import urllib.request
 
           status_word = os.environ["STATUS_WORD"]
           summary = os.environ["SUMMARY"]
           run_url = os.environ["RUN_URL"]
           report_url = os.environ["REPORT_URL"]
+          webhook_url = os.environ.get("TEAMS_WEBHOOK_URL", "")
 
           message_text = (
               f"**EDU-DEX feed: {status_word}**\n\n"
@@ -137,14 +139,28 @@ jobs:
               ],
           }
 
-          req = urllib.request.Request(
-              os.environ["TEAMS_WEBHOOK_URL"],
-              data=json.dumps(payload).encode("utf-8"),
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
-          with urllib.request.urlopen(req, timeout=15) as resp:
-              print("Teams webhook responded:", resp.status)
+          # A missing secret or a broken/unreachable webhook must never take
+          # down the actual feed build -- that would be strictly worse than
+          # just not getting notified. (ADDED 2026-11-25 after review.)
+          if not webhook_url:
+              print(
+                  "::warning::TEAMS_WEBHOOK_URL secret is not set -- skipping the Teams "
+                  "notification. Nothing else is affected. Add the secret in repo "
+                  "Settings > Secrets and variables > Actions to enable it."
+              )
+              sys.exit(0)
+
+          try:
+              req = urllib.request.Request(
+                  webhook_url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print("Teams webhook responded:", resp.status)
+          except Exception as exc:
+              print(f"::warning::Failed to post Teams notification: {exc}")
           PY
 
       - name: Upload feed for Pages
