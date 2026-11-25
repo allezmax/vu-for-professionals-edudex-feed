@@ -71,6 +71,82 @@ jobs:
           name: edudex-feed-report
           path: data/report.md
 
+      # ADDED 2026-11-24 (Max): the team needs to be actively told about a
+      # broken build or a flagged content change (a program the scraper can
+      # no longer read correctly, an override drifting from what's now live
+      # on vu.nl) -- not just have it sit in report.md/changelog.md on GitHub
+      # Pages until someone thinks to check. These two steps read the signal
+      # written by edudex_feed.main (data/notify.json) and, if it says
+      # something's worth a look, post it to the "EDU-DEX feed alert" Teams
+      # channel via its Workflows webhook. `if: always()` so this still runs
+      # (and reports the break) even when "Build feed" above failed.
+      - name: Check whether to notify Teams
+        if: always()
+        id: notify
+        run: python3 scripts/notify_check.py data/notify.json >> "$GITHUB_OUTPUT"
+
+      - name: Post Teams notification
+        if: always() && steps.notify.outputs.should_notify == 'true'
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          STATUS_WORD: ${{ steps.notify.outputs.build_failed == 'true' && 'BUILD FAILED' || 'content changed' }}
+          SUMMARY: ${{ steps.notify.outputs.summary }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/report.md
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          status_word = os.environ["STATUS_WORD"]
+          summary = os.environ["SUMMARY"]
+          run_url = os.environ["RUN_URL"]
+          report_url = os.environ["REPORT_URL"]
+
+          message_text = (
+              f"**EDU-DEX feed: {status_word}**\n\n"
+              f"{summary}\n\n"
+              f"Run: {run_url}\n\n"
+              f"Report: {report_url}"
+          )
+
+          # Confirmed 2026-11-24 (Max, via Hoppscotch): this Teams "Workflows"
+          # webhook (the current replacement for the old deprecated Office
+          # 365 Connectors) rejects a bare {"text": "..."} body -- it needs
+          # either an Adaptive Card or legacy MessageCard payload. This is
+          # the Adaptive Card shape, tested and confirmed working.
+          payload = {
+              "type": "message",
+              "attachments": [
+                  {
+                      "contentType": "application/vnd.microsoft.card.adaptive",
+                      "content": {
+                          "type": "AdaptiveCard",
+                          "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                          "version": "1.4",
+                          "body": [
+                              {
+                                  "type": "TextBlock",
+                                  "text": message_text,
+                                  "wrap": True,
+                              }
+                          ],
+                      },
+                  }
+              ],
+          }
+
+          req = urllib.request.Request(
+              os.environ["TEAMS_WEBHOOK_URL"],
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=15) as resp:
+              print("Teams webhook responded:", resp.status)
+          PY
+
       - name: Upload feed for Pages
         if: success()
         uses: actions/upload-pages-artifact@v3
