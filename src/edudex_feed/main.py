@@ -15,6 +15,9 @@ Orchestrates the whole pipeline:
      rather than the live crawl), and every program's sign-off status from
      config/approvals.yaml, so someone can review new/changed programs before
      trusting the feed blindly.
+  8. write data/notify.json -- a small machine-readable signal read by
+     .github/workflows/build-feed.yml (via scripts/notify_check.py) to decide
+     whether to post a Teams notification for this run (added 2026-11-24).
 
 Usage:
     python -m edudex_feed.main --config config/institute.yaml \\
@@ -72,6 +75,24 @@ def run(
     log.info("discovering programs...")
     discovered = discover.discover_programs()
     log.info("found %d programs", len(discovered))
+
+    # ADDED 2026-11-19: config/overrides.yaml's excluded_programs key was
+    # documented (in its own header comment, and in claude/feed-decisions-log.md)
+    # as filtering discover.py's results "before anything is scraped" -- but
+    # no code in this file (or anywhere else) actually read that key, so the 3
+    # programs it lists (Actualiteitenlezingen Pensioenrecht -- VU Law Academy,
+    # not SBE; IEMA -- actually run by Maastricht University; Investment
+    # masterclasses -- actually run by CFA Society NL) were still being
+    # scraped and published on every run despite being "excluded". This
+    # filters them out right after discovery, matching the documented intent.
+    excluded_ids = set(overrides_all.get("excluded_programs") or [])
+    if excluded_ids:
+        before = len(discovered)
+        discovered = [d for d in discovered if d.vu_id not in excluded_ids]
+        log.info(
+            "excluded %d program(s) per config/overrides.yaml's excluded_programs (%d -> %d)",
+            before - len(discovered), before, len(discovered),
+        )
 
     feed_dir.mkdir(parents=True, exist_ok=True)
     programs_dir = feed_dir / "programs"
@@ -167,6 +188,7 @@ def run(
 
     log.info("validating feed against live EDU-DEX XSDs...")
     problems = validate.validate_feed_dir(feed_dir)
+    build_failed = bool(problems)
     if problems:
         log.error("XSD validation failed for %d file(s) -- see data/report.md", len(problems))
         with open(report_dir / "report.md", "a", encoding="utf-8") as f:
@@ -175,6 +197,24 @@ def run(
                 f.write(f"### {path}\n\n")
                 for e in errs:
                     f.write(f"- {e}\n")
+
+    # ADDED 2026-11-24 (Max): writes data/notify.json, a small machine-readable
+    # signal that .github/workflows/build-feed.yml reads (via
+    # scripts/notify_check.py) to decide whether to post a Teams notification.
+    # Without this, a broken build or a flagged content change (a program the
+    # scraper can no longer read correctly, an override drifting from what's
+    # now live on vu.nl) would sit quietly in report.md/changelog.md until
+    # someone thought to go check -- exactly the risk the team flagged.
+    write_notify_signal(
+        report_dir / "notify.json",
+        build_failed=build_failed,
+        problems=problems,
+        findings=findings,
+        approval_statuses=approval_statuses,
+        run_date=run_date,
+    )
+
+    if build_failed:
         return 1
 
     log.info(
@@ -276,6 +316,70 @@ def write_report(
             lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_notify_signal(
+    path: Path,
+    build_failed: bool,
+    problems: dict | None,
+    findings: list | None,
+    approval_statuses: dict | None,
+    run_date: str,
+) -> None:
+    """Writes a small machine-readable summary (data/notify.json) that
+    .github/workflows/build-feed.yml reads (via scripts/notify_check.py) to
+    decide whether to post a Teams notification for this run. See the
+    ADDED 2026-11-24 comment at the call site in run() for why this exists.
+
+    Deliberately narrower than "did anything at all change": `findings` only
+    contains change-detection's risk-flagged kinds (a scraper losing its grip
+    on a page, a price's basis shifting, an override drifting from what's now
+    live, a program appearing/disappearing) -- a plain number moving with the
+    same wording (e.g. a routine, non-overridden tuition increase) is NOT in
+    `findings` and will not trigger a notification on its own. See
+    changelog.py's module docstring and tests for exactly what is and isn't
+    flagged.
+    """
+    problems = problems or {}
+    findings = findings or []
+    approval_statuses = approval_statuses or {}
+    stale = {pid: s for pid, s in approval_statuses.items() if s.get("status") != "current"}
+
+    should_notify = bool(build_failed or findings or stale)
+
+    lines: list[str] = []
+    if build_failed:
+        total_errors = sum(len(errs) for errs in problems.values())
+        lines.append(
+            f"BUILD FAILED: {len(problems)} file(s) failed EDU-DEX XSD validation "
+            f"({total_errors} error(s) total). The feed was NOT republished -- "
+            f"GitHub Pages still serves yesterday's last-good version."
+        )
+    if findings:
+        lines.append(f"{len(findings)} change(s) detected this run:")
+        for f in findings[:15]:
+            lines.append(f"  - {f['title']} ({f['program_id']}): [{f['kind']}] {f['detail']}")
+        if len(findings) > 15:
+            lines.append(f"  ...and {len(findings) - 15} more -- see changelog.md")
+    if stale:
+        lines.append(
+            f"{len(stale)} program(s) now need re-review "
+            f"(the approved value no longer matches the current scrape):"
+        )
+        for pid, s in list(stale.items())[:15]:
+            lines.append(f"  - {pid} (last approved by {s.get('approvedBy')} on {s.get('approvedAt')})")
+        if len(stale) > 15:
+            lines.append(f"  ...and {len(stale) - 15} more -- see report.md")
+
+    payload = {
+        "run_date": run_date,
+        "should_notify": should_notify,
+        "build_failed": build_failed,
+        "findings_count": len(findings),
+        "stale_approval_count": len(stale),
+        "summary": lines,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def cli():
